@@ -1,1 +1,133 @@
-# TODO: GPU training image (CUDA base, PyTorch GPU, flash-attn, bitsandbytes, deepspeed)
+# syntax=docker/dockerfile:1.7
+###############################################################################
+# Vertex AI training container — GPU.
+#
+# Architecture spec: ARCHITECTURE.md §10.1
+#   - Base: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 (digest-pinned)
+#   - Python 3.11 via deadsnakes PPA
+#   - System deps: git, build-essential, libaio-dev, curl, gcsfuse
+#   - Python deps: training/requirements.txt
+#   - App code: training/ only (data + weights downloaded at runtime)
+#   - Non-root user `trainer` uid 1000
+#   - Entrypoint: python -m training.train
+#   - Multi-stage: stage 1 builds flash-attn & bitsandbytes wheels;
+#                  stage 2 copies them in
+#   - HEALTHCHECK: none (Vertex AI does its own job-level health checks)
+###############################################################################
+
+# TODO(architect): replace tag with digest pin —
+# nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04@sha256:<sha>
+ARG CUDA_BASE=nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+# ------------------------------------------------------------ stage 1: builder
+FROM ${CUDA_BASE} AS builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG PY_VERSION=3.11
+
+# Build toolchain + Python 3.11 from deadsnakes. ninja + cmake are required by
+# flash-attn's setup.py; libaio-dev is required by DeepSpeed (if enabled later).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common \
+        ca-certificates \
+        curl \
+        gnupg \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python${PY_VERSION} \
+        python${PY_VERSION}-dev \
+        python${PY_VERSION}-venv \
+        python3-pip \
+        git \
+        build-essential \
+        cmake \
+        ninja-build \
+        libaio-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Make python3.11 the default `python` and `pip` in this stage.
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python${PY_VERSION} 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PY_VERSION} 1 \
+    && python -m pip install --upgrade pip wheel setuptools
+
+# Build wheels into /wheels for the runtime stage to consume.
+WORKDIR /build
+COPY training/requirements.txt /build/requirements.txt
+
+# Build flash-attn and bitsandbytes wheels separately (they take a long time
+# and benefit from BuildKit cache). MAX_JOBS keeps flash-attn from OOMing the
+# Cloud Build runner on E2_HIGHCPU_8 (8 vCPU / 8 GiB).
+ENV MAX_JOBS=4 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip wheel --wheel-dir=/wheels \
+        --no-deps \
+        flash-attn \
+        bitsandbytes
+
+# Compile the rest of training/requirements.txt to /wheels too. This is what
+# the runtime stage will `pip install` from — fully offline.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip wheel --wheel-dir=/wheels -r /build/requirements.txt
+
+# ----------------------------------------------------------- stage 2: runtime
+FROM ${CUDA_BASE} AS runtime
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG PY_VERSION=3.11
+
+# Runtime-only system deps (no build toolchain — keeps the layer small).
+# gcsfuse is included so workflows that want to mount large model caches can
+# do so; it sits idle if unused.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common \
+        ca-certificates \
+        curl \
+        gnupg \
+        git \
+        libaio1 \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python${PY_VERSION} \
+        python${PY_VERSION}-venv \
+    && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt gcsfuse-jammy main" > /etc/apt/sources.list.d/gcsfuse.list \
+    && curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+    && apt-get update && apt-get install -y --no-install-recommends gcsfuse \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python${PY_VERSION} 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PY_VERSION} 1 \
+    && curl -fsSL https://bootstrap.pypa.io/get-pip.py | python
+
+# Install the prebuilt wheels from stage 1. --no-index keeps pip from touching
+# the public index — reproducible by construction.
+COPY --from=builder /wheels /wheels
+COPY training/requirements.txt /tmp/requirements.txt
+RUN pip install --no-index --find-links=/wheels \
+        -r /tmp/requirements.txt \
+        flash-attn \
+        bitsandbytes \
+    && rm -rf /wheels /tmp/requirements.txt /root/.cache/pip
+
+# Non-root user — Vertex AI permits arbitrary uids; 1000 is conventional.
+ARG TRAINER_UID=1000
+RUN groupadd --system --gid ${TRAINER_UID} trainer \
+    && useradd --system --uid ${TRAINER_UID} --gid trainer --create-home --shell /bin/bash trainer
+
+# Copy app code last (highest change frequency → best layer reuse).
+WORKDIR /workspace
+COPY --chown=trainer:trainer training/ /workspace/training/
+
+USER trainer
+
+# Vertex AI sets AIP_* env vars at runtime; leave them unset here. PYTHONPATH
+# points at /workspace so `python -m training.train` resolves correctly.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/workspace \
+    HF_HOME=/workspace/.cache/huggingface \
+    TRANSFORMERS_CACHE=/workspace/.cache/huggingface/transformers
+
+ENTRYPOINT ["python", "-m", "training.train"]

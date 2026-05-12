@@ -1,1 +1,76 @@
-# TODO: Cloud Build config to build the training container image and push to Artifact Registry
+###############################################################################
+# Cloud Build — training image.
+#
+# Spec: ARCHITECTURE.md §9.2.
+# Trigger: §9.1 `train-image-<env>` (push to stage/main with path filters
+# training/** or docker/Dockerfile.training*).
+#
+# Substitutions (with sensible defaults — Terraform-managed triggers override
+# them per-env; manual `gcloud builds submit` uses these):
+#   _REGION       : Artifact Registry region (us-central1)
+#   _AR_REPO      : Artifact Registry repository (training-images)
+#   _IMAGE_NAME   : image name within the repo (train)
+#   _ENV          : stage or prod — selects the cloudbuild-<env> SA
+#   _DOCKERFILE   : docker/Dockerfile.training.gpu by default; can be flipped
+#                   to .training for CPU smoke builds
+#   _SBOM_BUCKET  : where to drop the scan output
+###############################################################################
+
+substitutions:
+  _REGION: us-central1
+  _AR_REPO: training-images
+  _IMAGE_NAME: train
+  _ENV: stage
+  _DOCKERFILE: docker/Dockerfile.training.gpu
+  _SBOM_BUCKET: ${PROJECT_ID}-build-artifacts
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --file=${_DOCKERFILE}
+      - --tag=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:${SHORT_SHA}
+      - --tag=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:latest
+      - --cache-from=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:latest
+      - --label=org.opencontainers.image.revision=${COMMIT_SHA}
+      - --label=org.opencontainers.image.source=https://github.com/${REPO_NAME}
+      - .
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}
+
+  # On-demand Container Analysis scan + SBOM dump. The scan is non-blocking
+  # (warnings only) — we still want the build to succeed so the worker can
+  # consume the image; security-team gating happens out-of-band against the
+  # SBOM artifact in the build-artifacts bucket.
+  - id: scan
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        IMAGE="${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:${SHORT_SHA}"
+        gcloud artifacts docker images scan "$$IMAGE" \
+          --format=json --location=${_REGION} > sbom.json || \
+          { echo "scan returned non-zero — proceeding with empty SBOM"; echo '{}' > sbom.json; }
+        gsutil cp sbom.json gs://${_SBOM_BUCKET}/sboms/${_IMAGE_NAME}/${SHORT_SHA}.json
+
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+  dynamicSubstitutions: true
+
+timeout: 1800s
+
+serviceAccount: projects/${PROJECT_ID}/serviceAccounts/cloudbuild-${_ENV}@${PROJECT_ID}.iam.gserviceaccount.com
+
+# Declared so Cloud Build records the image attestation in the build's metadata.
+images:
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:${SHORT_SHA}
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:latest

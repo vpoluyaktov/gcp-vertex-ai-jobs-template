@@ -1,0 +1,88 @@
+# Cloud Build sends the entire repo root as build context. Without this file
+# every Dockerfile would ship terraform/, .github/, docs/, etc. into the
+# layer — even though COPY only touches one subdirectory. This file keeps
+# the build context small and prevents accidental secret leakage.
+
+# Version control / CI
+.git
+.github
+.gitignore
+.gitattributes
+
+# Terraform — never needed in container builds; potential state leakage
+terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform/
+.terraform.lock.hcl
+
+# Python build / venv artefacts
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Editor / OS
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Docs and meta — not needed at runtime
+docs/
+ARCHITECTURE.md
+README.md
+LESSONS_LEARNED.md
+*.md
+!training/**/*.md
+!serving/**/*.md
+!data_prep/**/*.md
+!temporal/**/*.md
+
+# Secrets and credentials — should never be in any image
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+service-account*.json
+credentials*.json
+gcp-key*.json
+sa-key*.json
+*-key.json
+
+# ML scratch / large local artefacts
+wandb/
+mlruns/
+outputs/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Logs
+*.log
+.cache/
+
+# Test fixtures specific to local runs (uncomment if used)
+# data_prep/tests/fixtures/
+
+# Node — in case any front-end ever lands
+node_modules/

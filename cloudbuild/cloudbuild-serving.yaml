@@ -1,1 +1,108 @@
-# TODO: Cloud Build config to build the serving container image and push to Artifact Registry
+###############################################################################
+# Cloud Build — serving image.
+#
+# Spec: ARCHITECTURE.md §9.1 + §11.
+# Trigger: §9.1 `serving-image-<env>` (push to stage/main with path filter
+# serving/**, OR manual invocation from workflow Step 8 with _ADAPTER_URI set).
+#
+# The serving Dockerfile (serving/Dockerfile, owned by task #10) optionally
+# bakes a fine-tuned adapter into the image at build time. See §11.1 — if
+# _ADAPTER_URI is non-empty, serving/merge_adapter.py is invoked to merge
+# the adapter into base weights at build time.
+#
+# Substitutions:
+#   _REGION         : Artifact Registry region (us-central1)
+#   _AR_REPO        : Artifact Registry repository (serving-images)
+#   _IMAGE_NAME     : image name within the repo (serve)
+#   _ENV            : stage or prod
+#   _BASE_MODEL_ID  : HF model id of the base (e.g. meta-llama/Llama-3.1-8B-Instruct)
+#   _ADAPTER_URI    : optional gs:// URI of a fine-tuned adapter
+#   _TAG            : explicit image tag (defaults to SHORT_SHA — set this
+#                     when triggered from the workflow to encode the model
+#                     version, e.g. v3-llama-finetune-2026-05-12)
+#   _SBOM_BUCKET    : SBOM destination
+###############################################################################
+
+substitutions:
+  _REGION: us-central1
+  _AR_REPO: serving-images
+  _IMAGE_NAME: serve
+  _ENV: stage
+  _BASE_MODEL_ID: ""
+  _ADAPTER_URI: ""
+  _TAG: ""
+  _SBOM_BUCKET: ${PROJECT_ID}-build-artifacts
+
+steps:
+  - id: resolve-tag
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        # Fall back to SHORT_SHA when _TAG isn't provided. Workflow Step 8
+        # always sets _TAG to encode the model version; manual rebuilds get
+        # the commit SHA.
+        TAG="${_TAG}"
+        if [ -z "$$TAG" ]; then TAG="${SHORT_SHA}"; fi
+        echo "$$TAG" > /workspace/.tag
+        echo "Resolved image tag: $$TAG"
+
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        TAG=$$(cat /workspace/.tag)
+        IMG=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}
+        docker build \
+          --file=serving/Dockerfile \
+          --build-arg BASE_MODEL_ID=${_BASE_MODEL_ID} \
+          --build-arg ADAPTER_URI=${_ADAPTER_URI} \
+          --tag=$$IMG:$$TAG \
+          --tag=$$IMG:latest \
+          --cache-from=$$IMG:latest \
+          --label=org.opencontainers.image.revision=${COMMIT_SHA} \
+          --label=org.opencontainers.image.source=https://github.com/${REPO_NAME} \
+          --label=ai.adapter_uri=${_ADAPTER_URI} \
+          --label=ai.base_model=${_BASE_MODEL_ID} \
+          .
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}
+
+  - id: scan
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        TAG=$$(cat /workspace/.tag)
+        IMAGE=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:$$TAG
+        gcloud artifacts docker images scan "$$IMAGE" \
+          --format=json --location=${_REGION} > sbom.json || \
+          { echo "scan returned non-zero — proceeding with empty SBOM"; echo '{}' > sbom.json; }
+        gsutil cp sbom.json gs://${_SBOM_BUCKET}/sboms/${_IMAGE_NAME}/$$TAG.json
+
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+  dynamicSubstitutions: true
+
+# 1 hour — serving image rebuilds may pull large base-model weights when
+# _ADAPTER_URI triggers a merge.
+timeout: 3600s
+
+serviceAccount: projects/${PROJECT_ID}/serviceAccounts/cloudbuild-${_ENV}@${PROJECT_ID}.iam.gserviceaccount.com
+
+# Only :latest is in `images:` for attestation (the SHORT_SHA tag is harder
+# to declare statically since _TAG might override it).
+images:
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:latest
