@@ -139,6 +139,39 @@ resource "google_cloud_run_v2_service" "temporal_server" {
         value = var.temporal_namespace
       }
 
+      # Cloud SQL is configured with ssl_mode = ENCRYPTED_ONLY (see
+      # modules/cloud_sql/main.tf — pg_hba.conf rejects unencrypted connections).
+      # Two sets of env vars are required:
+      #
+      #   POSTGRES_TLS_* — consumed by the temporal-sql-tool that runs the
+      #     schema setup/migration step in auto-setup's startup script.
+      #
+      #   SQL_TLS_* — consumed by docker/config_template.yaml (rendered by
+      #     dockerize) to produce the temporal server's persistence config.
+      #     Without these the server reads its config with tls.enabled=false
+      #     and Cloud SQL rejects the unencrypted connection.
+      #
+      # Cloud SQL serves a GCP-issued server cert that does not match the
+      # private IP hostname, so host verification is disabled on both sides
+      # (encryption-on-the-wire is preserved; mTLS is not required given the
+      # network is private).
+      env {
+        name  = "POSTGRES_TLS_ENABLED"
+        value = "true"
+      }
+      env {
+        name  = "POSTGRES_TLS_DISABLE_HOST_VERIFICATION"
+        value = "true"
+      }
+      env {
+        name  = "SQL_TLS_ENABLED"
+        value = "true"
+      }
+      env {
+        name  = "SQL_HOST_VERIFICATION_ENABLED"
+        value = "false"
+      }
+
       startup_probe {
         # auto-setup runs schema migrations on first start — be patient.
         initial_delay_seconds = 30
@@ -150,14 +183,12 @@ resource "google_cloud_run_v2_service" "temporal_server" {
         }
       }
 
-      liveness_probe {
-        period_seconds    = 30
-        timeout_seconds   = 5
-        failure_threshold = 3
-        tcp_socket {
-          port = 7233
-        }
-      }
+      # NOTE: Cloud Run v2 does NOT support TCP-socket liveness probes (only
+      # startup probes accept tcp_socket). Temporal frontend speaks gRPC on
+      # :7233 and exposes no HTTP/2 health endpoint Cloud Run can hit, so we
+      # rely on the startup_probe above plus Cloud Run's own container-health
+      # supervision. If a probe is required later, expose a sidecar HTTP
+      # endpoint that proxies `temporal operator cluster health`.
     }
 
     timeout = "300s"

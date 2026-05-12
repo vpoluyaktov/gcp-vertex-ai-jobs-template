@@ -44,7 +44,10 @@ resource "google_cloudbuild_worker_pool" "private" {
   }
 
   network_config {
-    peered_network = var.network_self_link
+    # peered_network requires the form `projects/<project>/global/networks/<name>` —
+    # the API rejects the full https:// self_link. Strip the GCE API prefix from
+    # the self_link to produce that form.
+    peered_network = replace(var.network_self_link, "https://www.googleapis.com/compute/v1/", "")
     # An optional /29 from the VPC's reserved PSA range — letting GCP pick
     # keeps the module simple and avoids running out of space in the pool's
     # peering range as the env grows.
