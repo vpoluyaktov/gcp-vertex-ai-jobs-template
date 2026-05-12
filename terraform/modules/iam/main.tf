@@ -55,8 +55,13 @@ locals {
 
   # Project-level roles per §7. NO storage.objectAdmin at project level (§7.2).
   project_role_bindings = flatten([
-    # tf-deploy — owner, scoped via Terraform usage rather than IAM scoping
-    [for r in ["roles/owner"] : { sa = "tf-deploy", role = r }],
+    # tf-deploy — owner for Terraform; also explicit cloudbuild roles so CI can
+    # submit builds and use private worker pools without relying on owner catch-all.
+    [for r in [
+      "roles/owner",
+      "roles/cloudbuild.builds.editor",
+      "roles/cloudbuild.workerPoolUser",
+    ] : { sa = "tf-deploy", role = r }],
 
     # worker — submits Vertex jobs, triggers Cloud Build, reads logs/metrics,
     #          can be invoked, accesses Secret Manager
@@ -90,11 +95,15 @@ locals {
       "roles/logging.logWriter",
     ] : { sa = "serving", role = r }],
 
-    # cloudbuild — pushes images, deploys Cloud Run, writes build artifacts
+    # cloudbuild — pushes images, deploys Cloud Run, writes build artifacts.
+    # storage.objectViewer at project level lets the SA read source archives
+    # from the auto-created ${PROJECT_ID}_cloudbuild bucket when running with
+    # a custom serviceAccount field in the Cloud Build YAML.
     [for r in [
       "roles/artifactregistry.writer",
       "roles/logging.logWriter",
       "roles/run.admin",
+      "roles/storage.objectViewer",
     ] : { sa = "cloudbuild", role = r }],
 
     # ingest — only needs scoped bucket access; no project-level roles.
