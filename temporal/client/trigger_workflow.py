@@ -31,6 +31,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import sys
 import uuid
 from pathlib import Path
@@ -166,6 +167,23 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _ipv4_address(address: str) -> tuple[str, str]:
+    """Resolve host in 'host:port' to its first IPv4 address.
+
+    VPC connectors are IPv4-only; the Temporal Rust bridge (tokio) may pick
+    IPv6 first when both A and AAAA records exist, causing 'Network is
+    unreachable'. Force IPv4 here and return the original hostname for SNI.
+    """
+    host, _, port_str = address.rpartition(":")
+    port = int(port_str)
+    results = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    if not results:
+        raise RuntimeError(f"No IPv4 address found for {host!r}")
+    ipv4 = results[0][4][0]
+    logger.debug("Resolved %s -> %s (IPv4)", host, ipv4)
+    return f"{ipv4}:{port}", host
+
+
 def _resolve_defaults(args: argparse.Namespace) -> argparse.Namespace:
     if not args.temporal_address:
         args.temporal_address = f"temporal-server.{args.env}.internal:443"
@@ -180,12 +198,14 @@ async def _start(args: argparse.Namespace, request: FineTuneRequest, workflow_id
         args.temporal_address,
         args.namespace,
     )
+    # Force IPv4 — VPC connectors don't route IPv6; tokio picks AAAA first.
+    connect_addr, sni_host = _ipv4_address(args.temporal_address)
     client = await Client.connect(
-        args.temporal_address,
+        connect_addr,
         namespace=args.namespace,
         # TLS without client cert — Cloud Run terminates mutual auth at the
         # network layer; the client only needs server-side TLS.
-        tls=TLSConfig(),
+        tls=TLSConfig(domain=sni_host),
     )
 
     logger.info(
