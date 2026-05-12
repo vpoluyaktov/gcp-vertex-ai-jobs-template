@@ -39,7 +39,7 @@ from urllib.parse import urlparse
 
 import yaml
 from pydantic import ValidationError
-from temporalio.client import Client, WorkflowFailureError
+from temporalio.client import Client, TLSConfig, WorkflowFailureError
 
 # Importing the workflow class directly lets us start it by reference rather
 # than by stringly-typed name. Falling back to "FineTuneWorkflow" by name keeps
@@ -180,7 +180,13 @@ async def _start(args: argparse.Namespace, request: FineTuneRequest, workflow_id
         args.temporal_address,
         args.namespace,
     )
-    client = await Client.connect(args.temporal_address, namespace=args.namespace)
+    client = await Client.connect(
+        args.temporal_address,
+        namespace=args.namespace,
+        # TLS without client cert — Cloud Run terminates mutual auth at the
+        # network layer; the client only needs server-side TLS.
+        tls=TLSConfig(),
+    )
 
     logger.info(
         "starting workflow: id=%s task_queue=%s job_name=%s",
@@ -195,6 +201,11 @@ async def _start(args: argparse.Namespace, request: FineTuneRequest, workflow_id
         task_queue=args.task_queue,
     )
     # Always emit the handle details so the caller can correlate with Temporal UI.
+    ui_url = (
+        f"http://temporal-server.{args.env}.internal:8233"
+        f"/namespaces/{args.namespace}"
+        f"/workflows/{handle.id}/{handle.first_execution_run_id}"
+    )
     sys.stdout.write(
         json.dumps(
             {
@@ -203,6 +214,7 @@ async def _start(args: argparse.Namespace, request: FineTuneRequest, workflow_id
                 "task_queue": args.task_queue,
                 "namespace": args.namespace,
                 "temporal_address": args.temporal_address,
+                "ui_url": ui_url,
             },
             indent=2,
         )
