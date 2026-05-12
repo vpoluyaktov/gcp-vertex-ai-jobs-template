@@ -165,6 +165,53 @@ module "temporal_server" {
 }
 
 # -----------------------------------------------------------------------------
+# Secret Manager — §8 inventory of optional secrets. Payloads are populated
+# out-of-band via gcloud / scripts/bootstrap_secrets.sh — Terraform creates
+# empty placeholders only. temporal-postgres-password is owned by cloud_sql.
+# -----------------------------------------------------------------------------
+
+module "secret_manager" {
+  source = "./modules/secret_manager"
+
+  project_id  = var.project_id
+  app_name    = var.app_name
+  environment = var.environment
+  labels      = local.common_labels
+
+  # Most secrets are off by default; flip per-env via the root variables when
+  # the corresponding workflow option is in use.
+  enable_hf_token            = false
+  enable_w_and_b             = var.enable_w_and_b
+  enable_slack_webhook       = false
+  enable_sendgrid_api_key    = false
+  enable_github_pat_readonly = false
+
+  training_sa_email   = module.iam.training_sa_email
+  worker_sa_email     = module.iam.worker_sa_email
+  cloudbuild_sa_email = module.iam.cloudbuild_sa_email
+
+  depends_on = [google_project_service.apis]
+}
+
+# -----------------------------------------------------------------------------
+# Vertex AI — TensorBoard instance (per §15.0 single source of truth for
+# training metrics) + optional ML Metadata store backing Experiments/lineage.
+# Model Registry itself has no static resource — models are uploaded at
+# training time by the SDK.
+# -----------------------------------------------------------------------------
+
+module "vertex_ai" {
+  source = "./modules/vertex_ai"
+
+  project_id  = var.project_id
+  region      = var.region
+  app_name    = var.app_name
+  environment = var.environment
+  labels      = local.common_labels
+
+  depends_on = [google_project_service.apis]
+}
+
+# -----------------------------------------------------------------------------
 # TODO (next tasks): remaining modules per ARCHITECTURE.md §12.1:
-#   secret_manager → vertex_ai → cloud_run_worker → cloud_build → scheduler
-#   → monitoring
+#   cloud_run_worker → cloud_build → scheduler → monitoring

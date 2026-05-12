@@ -112,3 +112,26 @@ output "temporal_server_internal_hostname" {
   description = "Stable VPC-internal hostname (temporal-server.<env>.internal)"
   value       = module.temporal_server.internal_hostname
 }
+
+# -----------------------------------------------------------------------------
+# Secret Manager
+# -----------------------------------------------------------------------------
+
+output "secret_ids" {
+  description = "Map of bare secret name → full Secret Manager resource id (only enabled secrets appear)"
+  value       = module.secret_manager.secret_ids
+}
+
+# -----------------------------------------------------------------------------
+# Vertex AI
+# -----------------------------------------------------------------------------
+
+output "tensorboard_resource_name" {
+  description = "Full TensorBoard resource name — passed to CustomJob.job_spec.tensorboard and consumed by train.py via aiplatform.Tensorboard(...) per §15.0"
+  value       = module.vertex_ai.tensorboard_resource_name
+}
+
+output "metadata_store_name" {
+  description = "ML Metadata store resource name (empty when not created — default store is used)"
+  value       = module.vertex_ai.metadata_store_name
+}
