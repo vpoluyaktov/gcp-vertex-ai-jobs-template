@@ -39,6 +39,10 @@ crash.*.log
 # This mirrors gcp-cloudrun-template and gcp-clouddeploy-gke-template.
 !terraform/stage/stage.tfvars
 !terraform/prod/prod.tfvars
+
+# CI copies stage/backend.tf or prod/backend.tf into terraform/backend.tf
+# before `terraform init`. The committed copies live under the env subdirs.
+terraform/backend.tf
 override.tf
 override.tf.json
 *_override.tf

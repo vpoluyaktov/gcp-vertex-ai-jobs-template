@@ -1,20 +1,34 @@
 ###############################################################################
-# Staging root module.
+# Single shared root module — mirrors gcp-cloudrun-template /
+# gcp-clouddeploy-gke-template.
 #
-# Backend, provider, and variable conventions mirror the reference templates
-# (gcp-cloudrun-template, gcp-clouddeploy-gke-template):
-#   - Per-environment state bucket (backend.tf in this directory).
-#   - Project ID and all env-specific values come from terraform.tfvars.
-#   - CI authenticates with GCP_STAGE_SA_KEY (see .github/workflows/deploy-stage.yml).
+# This directory is THE root module for both stage and prod. The per-env
+# subdirectories (stage/, prod/) hold only `backend.tf` and `<env>.tfvars`.
+# CI copies the right backend.tf in before `terraform init`:
 #
-# Module wiring follows ARCHITECTURE.md §12.1. Module bodies are intentionally
-# TODO placeholders today — see terraform/modules/*/main.tf. As each module
-# lands, replace the corresponding stub block below with the real invocation.
+#   cd terraform
+#   cp stage/backend.tf backend.tf      # or prod/backend.tf
+#   terraform init
+#   terraform plan -var-file=stage/stage.tfvars -out=tfplan
+#   terraform apply tfplan
+#
+# Auth uses GCP_STAGE_SA_KEY for the stage branch, GCP_PROD_SA_KEY for main.
+# Module wiring follows ARCHITECTURE.md §12.1; module bodies are TODO today.
 ###############################################################################
+
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+provider "google-beta" {
+  project = var.project_id
+  region  = var.region
+}
 
 # Built-in sentinel — keeps `terraform plan` producing a non-empty graph until
 # the real modules land. Uses terraform_data so no extra provider is required.
-# Safe to remove once any real module is wired in.
+# Safe to remove once any real module is wired in below.
 resource "terraform_data" "scaffold_sentinel" {
   input = {
     environment = var.environment
@@ -29,14 +43,14 @@ resource "terraform_data" "scaffold_sentinel" {
 # → monitoring.
 #
 # module "gcs_buckets" {
-#   source      = "../modules/gcs"
+#   source      = "./modules/gcs"
 #   project_id  = var.project_id
 #   app_name    = var.app_name
 #   environment = var.environment
 # }
 #
 # module "iam" {
-#   source      = "../modules/iam"
+#   source      = "./modules/iam"
 #   project_id  = var.project_id
 #   app_name    = var.app_name
 #   environment = var.environment

@@ -1,12 +1,8 @@
 name: deploy-prod
 
 # Mirrors the per-env separation from gcp-cloudrun-template and
-# gcp-clouddeploy-gke-template:
-#   - Backend bucket and project ID are pinned per env (see terraform/prod/).
-#   - Auth is via the GCP_PROD_SA_KEY GitHub secret.
-#   - `terraform init` runs inside terraform/prod so the right backend.tf is used.
-#   - tfvars file is committed at terraform/prod/prod.tfvars and passed
-#     explicitly via `-var-file` (matches reference template naming).
+# gcp-clouddeploy-gke-template — single root module + env-specific backend.tf
+# copied in at CI time + env-specific tfvars passed via -var-file.
 on:
   push:
     branches: [main]
@@ -20,7 +16,6 @@ env:
   TF_VERSION: "1.6.6"
   GCP_PROJECT_ID: dfh-prod-id
   TF_STATE_BUCKET: dfh-prod-tfstate
-  TF_DIR: terraform/prod
 
 permissions:
   contents: read
@@ -36,11 +31,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Auth via the production deploy SA key.
-      # NOTE: This template uses a single auth step (the workflow file itself is
-      # env-specific). The conditional-auth pattern from gcp-clouddeploy-gke-template
-      # exists to guard against the GitHub Actions `${{ A && B || C }}` ternary
-      # bug — that bug cannot apply here because no ternary is used.
+      # The workflow file is env-specific, so a single auth step is safe.
+      # The conditional-auth pattern from gcp-clouddeploy-gke-template only
+      # exists to dodge the `${{ A && B || C }}` ternary fall-through bug —
+      # not applicable here.
       - name: Authenticate to Google Cloud (production)
         uses: google-github-actions/auth@v2
         with:
@@ -56,32 +50,35 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      # Pre-flight: fail fast with a clear message if a resource Terraform expects
-      # to create already exists outside its state. Per ARCHITECTURE.md §9.4.
+      # Pre-flight: fail fast (today, log-only) if a resource Terraform expects
+      # to create already exists outside its state. Per template-standards.md §4.
       - name: Pre-deploy resource conflict check
         run: |
           echo "Checking for pre-existing resources in ${GCP_PROJECT_ID}..."
           gcloud firestore databases list --project="${GCP_PROJECT_ID}" --format="value(name)" || true
           gcloud run services list --project="${GCP_PROJECT_ID}" --format="value(metadata.name)" || true
           gsutil ls -p "${GCP_PROJECT_ID}" 2>/dev/null || true
-          # TODO(devops): once modules are wired, fail this step on a real conflict
-          # rather than just logging.
+          # TODO(devops): once modules are wired, fail this step on a real conflict.
+
+      # The single root lives at terraform/. CI copies the env-specific
+      # backend.tf in before init so the state goes to the right bucket.
+      - name: Stage backend config
+        run: cp terraform/prod/backend.tf terraform/backend.tf
+
+      - name: Terraform fmt -check
+        run: terraform -chdir=terraform fmt -check -recursive
 
       - name: Terraform init
-        working-directory: ${{ env.TF_DIR }}
-        run: terraform init -input=false
+        run: terraform -chdir=terraform init -input=false
 
       - name: Terraform validate
-        working-directory: ${{ env.TF_DIR }}
-        run: terraform validate
+        run: terraform -chdir=terraform validate
 
       - name: Terraform plan
-        working-directory: ${{ env.TF_DIR }}
-        run: terraform plan -input=false -var-file=prod.tfvars -out=tfplan
+        run: terraform -chdir=terraform plan -input=false -var-file=prod/prod.tfvars -out=tfplan
 
       - name: Terraform apply
-        working-directory: ${{ env.TF_DIR }}
-        run: terraform apply -input=false -auto-approve tfplan
+        run: terraform -chdir=terraform apply -input=false -auto-approve tfplan
 
       # TODO(devops): once modules land, follow with build/push images and
       # deploy the Temporal worker. Pattern mirrors gcp-cloudrun-template

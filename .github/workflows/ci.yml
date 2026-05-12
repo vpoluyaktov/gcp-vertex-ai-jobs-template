@@ -11,12 +11,8 @@ permissions:
 
 jobs:
   terraform-validate:
-    name: terraform fmt + validate (${{ matrix.env }})
+    name: terraform fmt + validate
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        env: [stage, prod]
     steps:
       - uses: actions/checkout@v4
 
@@ -26,16 +22,16 @@ jobs:
           terraform_version: "1.6.6"
 
       - name: terraform fmt -check
-        run: terraform fmt -check -recursive terraform/
+        run: terraform -chdir=terraform fmt -check -recursive
 
-      # Validate against a local backend so no GCP creds are required for CI.
+      # Validate the single root module. -backend=false skips backend init so
+      # no GCP creds are needed. The env-specific backend.tf files (in stage/
+      # and prod/) are pure HCL declarations — they're covered by fmt -check.
       - name: terraform init (no backend)
-        working-directory: terraform/${{ matrix.env }}
-        run: terraform init -backend=false -input=false
+        run: terraform -chdir=terraform init -backend=false -input=false
 
       - name: terraform validate
-        working-directory: terraform/${{ matrix.env }}
-        run: terraform validate
+        run: terraform -chdir=terraform validate
 
   python-lint:
     name: python lint + test
