@@ -34,6 +34,11 @@ crash.log
 crash.*.log
 *.tfvars
 !*.tfvars.example
+# Per-environment tfvars files hold non-secret config (project IDs, feature
+# flags) and MUST be checked in so CI can run `terraform apply -var-file=...`.
+# This mirrors gcp-cloudrun-template and gcp-clouddeploy-gke-template.
+!terraform/stage/stage.tfvars
+!terraform/prod/prod.tfvars
 override.tf
 override.tf.json
 *_override.tf

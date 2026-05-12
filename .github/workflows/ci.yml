@@ -1,12 +1,49 @@
-# TODO: CI workflow — lint (ruff/flake8) and test (pytest) on push/PR
 name: ci
+
+# Lint + validate on every push / PR. Runs before deploy-stage / deploy-prod.
 on:
   push:
     branches: [main, stage]
   pull_request:
+
+permissions:
+  contents: read
+
 jobs:
-  lint-test:
+  terraform-validate:
+    name: terraform fmt + validate (${{ matrix.env }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [stage, prod]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.6"
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive terraform/
+
+      # Validate against a local backend so no GCP creds are required for CI.
+      - name: terraform init (no backend)
+        working-directory: terraform/${{ matrix.env }}
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        working-directory: terraform/${{ matrix.env }}
+        run: terraform validate
+
+  python-lint:
+    name: python lint + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # TODO: setup-python, install deps, run lint + tests
+      # TODO(backend/qa): wire up setup-python + ruff + pytest once the Python
+      # source tree is populated. Keeping this as a placeholder so the workflow
+      # graph stays accurate.
+      - name: Placeholder
+        run: echo "Python lint + tests will land once source files exist."
