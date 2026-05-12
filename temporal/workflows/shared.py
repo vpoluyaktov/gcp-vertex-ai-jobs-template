@@ -34,7 +34,7 @@ class DataFormat(str, Enum):
 
 
 class ModelConfig(BaseModel):
-    base_model_id: str = "unsloth/Meta-Llama-3.1-8B-Instruct"
+    base_model_id: str = Field("unsloth/Meta-Llama-3.1-8B-Instruct", min_length=1)
     revision: Optional[str] = "main"
 
 
@@ -89,9 +89,9 @@ class ArtifactConfig(BaseModel):
 
 
 class EvaluationConfig(BaseModel):
-    min_eval_score: Optional[float] = None
+    min_eval_score: Optional[float] = Field(None, ge=0.0, le=1.0)
     retry_on_low_score: bool = False
-    retry_lr_multiplier: float = 0.5
+    retry_lr_multiplier: float = Field(0.5, gt=0)
 
 
 class NotificationConfig(BaseModel):
