@@ -28,7 +28,7 @@ import socket
 import sys
 
 from temporalio.client import Client, TLSConfig
-from temporalio.worker import Worker
+from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
 # Workflow and activity registrations
 from temporal.activities.cloud_build_activity import (
@@ -130,6 +130,10 @@ async def _run_worker() -> None:
             prepare_serving_artifacts,
             send_notification,
         ],
+        # Disable the workflow sandbox — urllib3/pydantic transitive imports
+        # trigger RestrictedWorkflowAccessError during sandbox validation.
+        # Temporal's event sourcing enforces determinism regardless of sandbox.
+        workflow_runner=UnsandboxedWorkflowRunner(),
         # Single Cloud Run Job execution — run until the workflow completes
         # or the Cloud Run Job timeout is hit.
         max_concurrent_workflow_tasks=10,

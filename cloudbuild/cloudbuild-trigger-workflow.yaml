@@ -6,19 +6,22 @@
 # tests by manual invocation with _JOB_CONFIG_URI set to a real job YAML.
 #
 # This config is NOT an image build — it's a one-shot job-submitter using
-# the Temporal Python client. It runs INSIDE the env's VPC by attaching to
-# the Serverless VPC Access Connector so it can reach the Temporal server's
-# INTERNAL ingress.
+# the Temporal Python client. It runs on the Private Worker Pool (which is
+# peered into the env's VPC) so it can reach the Temporal server's INTERNAL
+# ingress over the project network.
+#
+# IMPORTANT: Cloud Build private pool workers run in a separate tenant VPC
+# peered with the project VPC. Cloud DNS private zones are NOT automatically
+# visible from peered VPCs. Use the Cloud Run service URL directly for
+# _TEMPORAL_ADDRESS rather than the private DNS CNAME
+# (temporal-server.<env>.internal:443).
 #
 # Substitutions:
 #   _ENV               : stage or prod
 #   _REGION            : Cloud Build / VPC region (us-central1)
-#   _VPC_CONNECTOR     : name of the Serverless VPC Access Connector (output
-#                        of the networking module: `vpcconn-<env>`)
-#   _TEMPORAL_ADDRESS  : VPC-internal address of the Temporal server, e.g.
-#                        temporal-server.stage.internal:443 (gRPC over TLS;
-#                        Cloud Run terminates TLS at the edge — see DevOps
-#                        note in terraform/modules/temporal_server/main.tf)
+#   _TEMPORAL_ADDRESS  : address of the Temporal server. Use the Cloud Run
+#                        .run.app URL (e.g. temporal-server-stage-<hash>-uc.a.run.app:443)
+#                        — private DNS CNAMEs don't resolve from private pool VMs.
 #   _TEMPORAL_NAMESPACE: "default"
 #   _TEMPORAL_TASK_QUEUE: "vertex-finetune-<env>"
 #   _JOB_CONFIG_URI    : gs:// URI of the job YAML to submit. Defaults to the
@@ -32,7 +35,6 @@
 substitutions:
   _ENV: stage
   _REGION: us-central1
-  _VPC_CONNECTOR: vpcconn-${_ENV}
   _TEMPORAL_ADDRESS: temporal-server.${_ENV}.internal:443
   _TEMPORAL_NAMESPACE: default
   _TEMPORAL_TASK_QUEUE: vertex-finetune-${_ENV}
