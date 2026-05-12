@@ -11,11 +11,13 @@
 
 ### 1.1 Purpose
 
-`gcp-vertex-ai-jobs-template` is a **reusable, opinionated template** for automated supervised fine-tuning (SFT) of open-source large language models (Llama 3.1, Mistral, Qwen, Phi, etc.) on domain-specific data such as investment documents, contracts, invoices, and financial statements. It is designed to be **forked once per domain/customer**, parameterized via Terraform variables and Hydra/YAML configs, and operated unattended end-to-end:
+`gcp-vertex-ai-jobs-template` is a **reusable, opinionated template** for automated supervised fine-tuning (SFT) of open-source large language models (Unsloth-quantized Llama 3.1, Mistral, Qwen, Phi, etc.) on domain-specific data such as investment documents, contracts, invoices, and financial statements. It is designed to be **forked once per domain/customer**, parameterized via Terraform variables and Hydra/YAML configs, and operated unattended end-to-end:
 
 - Drop raw documents (PDF, DOCX, HTML, JSON) into a GCS bucket.
-- A Temporal workflow validates the data, builds a training image (if needed), submits a Vertex AI `CustomJob`, polls until done, registers the resulting model, optionally pushes the LoRA adapter to Hugging Face Hub, and prepares a vLLM serving container.
-- Spot VMs are used by default; the workflow transparently falls back to On-Demand if the Spot capacity request is rejected or the job is preempted more than `N` times.
+- A Temporal workflow validates the data, builds a training image (if needed), submits a Vertex AI `CustomJob`, polls until done, registers the resulting model, optionally pushes the LoRA adapter to Hugging Face Hub, and **builds + pushes** a vLLM serving container image to Artifact Registry.
+- Spot VMs are used by default **when `use_gpu=true`**; the workflow transparently falls back to On-Demand if the Spot capacity request is rejected or the job is preempted more than `N` times. CPU-only jobs (the default) do not use Spot.
+
+> **Out of scope:** this template **does not deploy a serving endpoint.** It only builds and pushes the serving container image to Artifact Registry. Deploying it to a runtime belongs in `gcp-cloudrun-template` or `gcp-clouddeploy-gke-template`.
 
 ### 1.2 Design goals
 
@@ -33,10 +35,12 @@
 
 | Layer | Technology | Version pin |
 |-------|------------|------------|
-| **Orchestration** | Temporal (Cloud or self-hosted) | Python SDK `temporalio>=1.7,<2` |
-| **Worker runtime** | Cloud Run Job (or Cloud Run Service for long-poll worker) | n/a |
+| **Orchestration** | Temporal — **self-hosted on Cloud Run Service** (min-instances=1, always-on) | Python SDK `temporalio>=1.7,<2`; server image `temporalio/auto-setup:1.25` (digest-pinned) |
+| **Temporal persistence** | **Cloud SQL for PostgreSQL** (Terraform-provisioned, private IP, single instance per env) | `POSTGRES_15` |
+| **Worker runtime** | Cloud Run **Job** (one-shot per workflow execution; spawned by client) | n/a |
+| **Worker → Temporal connectivity** | Private VPC via Serverless VPC Access Connector; internal DNS `temporal-server.<env>.internal:7233` | no public ingress on Temporal |
 | **Training** | Vertex AI `CustomJob` API | `google-cloud-aiplatform>=1.71,<2` |
-| **Training framework** | HF `transformers`, `peft`, `trl`, `accelerate`, `bitsandbytes` | `transformers>=4.45,<4.55` |
+| **Training framework** | HF `transformers`, `peft`, `trl`, `accelerate`, `bitsandbytes`, **`unsloth`** | `transformers>=4.45,<4.55`; `unsloth>=2024.10` |
 | **Config** | Hydra + OmegaConf + YAML | `hydra-core>=1.3,<1.4` |
 | **Serving** | vLLM | `vllm>=0.6.3,<0.7` |
 | **IaC** | Terraform | **>= 1.6** |
@@ -262,7 +266,7 @@ The workflow takes a single `FineTuneRequest` (Python `pydantic.BaseModel` share
 job_name: string                   # required, ≤ 60 chars, [a-z0-9-]
 config_uri: string                 # required, gs://… path to job YAML (configs/jobs/*.yaml)
 model:
-  base_model_id: string            # e.g. "meta-llama/Llama-3.1-8B-Instruct"
+  base_model_id: string            # default: "unsloth/Meta-Llama-3.1-8B-Instruct" (Unsloth quantized, no HF gating)
   revision: string|null            # HF commit SHA; null → "main"
 peft:
   type: enum[lora, qlora, none]
@@ -286,12 +290,13 @@ training:
   bf16: bool                       # default true
   gradient_checkpointing: bool     # default true
 infrastructure:
-  machine_type: string             # default "a2-highgpu-1g"
-  accelerator_type: string         # default "NVIDIA_TESLA_A100"
-  accelerator_count: int           # default 1
-  spot: bool                       # default true
-  fallback_on_demand: bool         # default true
-  max_preemptions: int             # default 2
+  use_gpu: bool                    # default false — CPU-only is the template default (see §4.4)
+  machine_type: string             # default "n1-standard-8" (CPU); when use_gpu=true → "a2-highgpu-1g"
+  accelerator_type: string|null    # default null (CPU); when use_gpu=true → "NVIDIA_TESLA_A100"
+  accelerator_count: int           # default 0 (CPU); when use_gpu=true → 1
+  spot: bool                       # default true; IGNORED when use_gpu=false (no Spot discount for CPU)
+  fallback_on_demand: bool         # default true; only meaningful when use_gpu=true
+  max_preemptions: int             # default 2; only meaningful when use_gpu=true
   region: string                   # default "us-central1"
 artifacts:
   output_uri: string               # gs://…/final-models/<job_name>/
@@ -317,7 +322,7 @@ A concrete **request JSON example** the client sends to Temporal:
   "job_name": "invoices-llama3-8b-lora-v1",
   "config_uri": "gs://dfh-stage-id-configs/jobs/invoices_llama3_8b_lora.yaml",
   "model": {
-    "base_model_id": "meta-llama/Llama-3.1-8B-Instruct",
+    "base_model_id": "unsloth/Meta-Llama-3.1-8B-Instruct",
     "revision": "main"
   },
   "peft": {
@@ -345,6 +350,7 @@ A concrete **request JSON example** the client sends to Temporal:
     "gradient_checkpointing": true
   },
   "infrastructure": {
+    "use_gpu": true,
     "machine_type": "a2-highgpu-1g",
     "accelerator_type": "NVIDIA_TESLA_A100",
     "accelerator_count": 1,
@@ -382,7 +388,7 @@ A concrete **request JSON example** the client sends to Temporal:
   "workflow_id": "ft-9a3b1c7e-20260512-141022",
   "vertex_job_id": "projects/123/locations/us-central1/customJobs/8821937429347",
   "model": {
-    "base_model_id": "meta-llama/Llama-3.1-8B-Instruct",
+    "base_model_id": "unsloth/Meta-Llama-3.1-8B-Instruct",
     "adapter_uri": "gs://dfh-stage-id-final-models/invoices-llama3-8b-lora-v1/adapter/",
     "merged_uri": null,
     "vertex_model_resource": "projects/123/locations/us-central1/models/9182736455@1",
@@ -568,13 +574,25 @@ LONG_POLL_RETRY = RetryPolicy(
 
 ### 4.1 `worker_pool_specs` construction
 
+The `machine_spec` is **selected from `use_gpu`** at workflow time. The activity in `temporal/activities/submit_training.py` MUST build `machine_spec` like this:
+
 ```python
+# CPU-only (default — for template/CI smoke testing only)
+if not req.infrastructure.use_gpu:
+    machine_spec = {
+        "machine_type": req.infrastructure.machine_type or "n1-standard-8",
+        # No accelerator_type / accelerator_count fields when CPU-only.
+    }
+# GPU
+else:
+    machine_spec = {
+        "machine_type": req.infrastructure.machine_type or "a2-highgpu-1g",
+        "accelerator_type": req.infrastructure.accelerator_type or "NVIDIA_TESLA_A100",
+        "accelerator_count": req.infrastructure.accelerator_count or 1,
+    }
+
 worker_pool_spec = {
-  "machine_spec": {
-    "machine_type": req.infrastructure.machine_type,          # e.g. "a2-highgpu-1g"
-    "accelerator_type": req.infrastructure.accelerator_type,  # e.g. "NVIDIA_TESLA_A100"
-    "accelerator_count": req.infrastructure.accelerator_count
-  },
+  "machine_spec": machine_spec,
   "replica_count": 1,
   "disk_spec": { "boot_disk_type": "pd-ssd", "boot_disk_size_gb": 500 },
   "container_spec": {
@@ -587,11 +605,29 @@ worker_pool_spec = {
       f"+job.workflow_id={workflow.info().workflow_id}",
     ],
     "env": [
+      # HF_TOKEN is OPTIONAL — only needed when artifacts.upload_hf_hub=true
+      # (Unsloth base models are ungated, so no HF_TOKEN required for downloads).
       { "name": "HF_TOKEN", "value": SECRET_REF("hf-token") },
       { "name": "WANDB_API_KEY", "value": SECRET_REF("wandb-api-key") },
       { "name": "TRANSFORMERS_CACHE", "value": "/gcs-fuse/model-cache" },
     ]
   }
+}
+```
+
+#### 4.1.a Concrete CPU-only `machine_spec`
+
+```json
+{ "machine_type": "n1-standard-8" }
+```
+
+#### 4.1.b Concrete GPU `machine_spec`
+
+```json
+{
+  "machine_type": "a2-highgpu-1g",
+  "accelerator_type": "NVIDIA_TESLA_A100",
+  "accelerator_count": 1
 }
 ```
 
@@ -646,6 +682,29 @@ ResourceExhausted             Submitted OK
 ```
 
 Implementation: encoded inside the **workflow** (not inside Step 3) so that all decisions are deterministic and replayable.
+
+**Spot is GPU-only.** When `use_gpu=false` the workflow forces `scheduling.strategy = STANDARD` regardless of `infrastructure.spot` — there is no Spot discount for CPU-only Vertex AI CustomJobs, and the fallback path collapses to a single STANDARD submission.
+
+### 4.4 CPU-only default — what it's for and what it isn't
+
+| | |
+|---|---|
+| **Default** | `use_gpu = false`, `machine_type = "n1-standard-8"`, no accelerator |
+| **Purpose** | Template development, smoke tests, CI end-to-end runs that exercise the workflow plumbing (data prep → submit → monitor → save → register → serving image) without burning GPU budget |
+| **NOT for** | Production fine-tuning of 7B+ parameter models. A 7B SFT on CPU is impractical (days–weeks per epoch) and will likely hit Vertex AI's 7-day CustomJob timeout |
+
+> **⚠️ Warning — required in train.py startup logs**
+> If `use_gpu=false` is detected at train start and `model.base_model_id` resolves to a model > 1B parameters, `train.py` MUST log a prominent warning:
+> `WARN: CPU-only training of a >1B-parameter model is intended for template development and CI smoke testing ONLY. For real workloads, set infrastructure.use_gpu=true.`
+
+To switch to a real run, flip the config:
+
+```yaml
+infrastructure:
+  use_gpu: true                # → a2-highgpu-1g + NVIDIA_TESLA_A100 × 1 by default
+  spot: true                   # Spot fallback now applies
+  fallback_on_demand: true
+```
 
 ---
 
@@ -808,14 +867,14 @@ Secrets are created in `terraform/modules/secret_manager`. **Secret payloads are
 
 | Secret name | Purpose | Consumers (SA principals) | Required? |
 |---|---|---|---|
-| `hf-token` | Hugging Face Hub auth (download gated models, push adapters) | `training-<env>`, `worker-<env>` | yes if `upload_hf_hub=true` OR base model is gated |
+| `hf-token` | Hugging Face Hub auth — **only** for `artifacts.upload_hf_hub=true` (pushing fine-tuned adapters back to HF Hub). Unsloth base models are **ungated**, so downloading them needs no token. | `training-<env>`, `worker-<env>` | optional — only if `upload_hf_hub=true` |
 | `wandb-api-key` | Weights & Biases logging | `training-<env>` | only if logging profile `wandb` |
-| `temporal-api-key` | Auth to Temporal Cloud namespace | `worker-<env>` | yes if `TEMPORAL_CLOUD=true` |
-| `temporal-tls-cert` | mTLS client cert | `worker-<env>` | yes if `TEMPORAL_CLOUD=true` |
-| `temporal-tls-key` | mTLS client key | `worker-<env>` | yes if `TEMPORAL_CLOUD=true` |
+| `temporal-postgres-password` | Postgres password for the self-hosted Temporal server's Cloud SQL backend. Generated at apply time by `random_password` and stored in Secret Manager; mounted into the `temporal-server` Cloud Run Service. | `temporal-server-<env>` | yes (always) |
 | `slack-webhook` | Slack notifications from Step 9 | `worker-<env>` | optional |
 | `sendgrid-api-key` | Email notifications | `worker-<env>` | optional |
 | `github-pat-readonly` | Cloud Build → private GitHub repos (if any submodules) | `cloudbuild-<env>` | optional |
+
+> Note: there are no `temporal-api-key` / `temporal-tls-cert` / `temporal-tls-key` secrets. The Temporal server is **self-hosted on Cloud Run** (see §12.6) and reached over a private VPC connector; mTLS to Temporal is disabled inside the VPC. The previous Temporal Cloud path was rejected in design review.
 
 Secrets are referenced in Vertex AI CustomJob env vars using the form `projects/<project>/secrets/<name>/versions/latest` (Vertex AI auto-resolves Secret Manager references when granted `roles/secretmanager.secretAccessor`).
 
@@ -1024,17 +1083,21 @@ Terraform files: **Architect specifies; DevOps implements.** This template does 
 ### 12.1 Per-environment wiring (`terraform/stage/main.tf` outline)
 
 ```
+module "networking"       → VPC + subnet + Serverless VPC Access Connector + Private Service Access (REQUIRED; not optional)
 module "gcs_buckets"      → 5 buckets + lifecycle + IAM
 module "iam"              → all SAs + role bindings (incl. Workload Identity)
 module "artifact_registry"→ 2 repos: training, serving (+ data_prep if used)
-module "secret_manager"   → 5–8 secrets (per §8)
+module "secret_manager"   → 4–6 secrets (per §8)
+module "cloud_sql"        → Cloud SQL for PostgreSQL instance (Temporal persistence) — private IP only
+module "temporal_server"  → Cloud Run **Service** running temporalio/auto-setup, min-instances=1, VPC-attached, env vars wired to Cloud SQL
 module "vertex_ai"        → TensorBoard instance, Model Registry placeholders
-module "cloud_run_worker" → Cloud Run Job + scheduler (and/or Service)
+module "cloud_run_worker" → Cloud Run **Job** (temporal worker), VPC-attached so it can reach temporal-server over private DNS
 module "cloud_build"      → 4 triggers
 module "scheduler"        → optional Cloud Scheduler jobs
-module "networking"       → optional VPC + private service access
 module "monitoring"       → alert policies + uptime checks + dashboards
 ```
+
+The `networking`, `cloud_sql`, and `temporal_server` modules are **new and mandatory** (replacing the prior Temporal Cloud path). Apply order is enforced by `depends_on`: `networking` → `cloud_sql` → `temporal_server` → `cloud_run_worker`.
 
 ### 12.2 Required Terraform variables
 
@@ -1046,9 +1109,12 @@ module "monitoring"       → alert policies + uptime checks + dashboards
 | `app_name` | string | yes | `gcp-vertex-ai-jobs-template` (or override per fork) |
 | `dns_zone_project` | string | yes | `dfh-ops-id` |
 | `dns_zone_name` | string | yes | `demo-devops-for-hire-com` |
-| `temporal_cloud` | bool | no, default `false` | If true, skip self-hosted Temporal module |
-| `temporal_namespace` | string | conditional | Required if `temporal_cloud=true` |
-| `vpc_enabled` | bool | no, default `false` | If true, create VPC + private service access |
+| `temporal_namespace` | string | yes | Temporal namespace name; default `default` |
+| `cloud_sql_tier` | string | yes | Cloud SQL instance tier for Temporal Postgres; default `db-custom-2-7680` (2 vCPU, 7.5 GiB) |
+| `cloud_sql_disk_gb` | number | yes | Postgres disk size in GB; default `20` |
+| `temporal_server_image` | string | yes | Pinned digest of `temporalio/auto-setup:1.25` (Architect publishes the digest; DevOps overrides per env if needed) |
+| `vpc_cidr` | string | yes | CIDR for the env subnet, e.g. `10.20.0.0/24` (stage), `10.30.0.0/24` (prod) |
+| `vpc_connector_cidr` | string | yes | /28 reserved for the Serverless VPC Access Connector, e.g. `10.20.1.0/28` |
 | `enable_w_and_b` | bool | no, default `false` | Provision `wandb-api-key` secret |
 | `notification_channels` | list(string) | no, default `[]` | Resource IDs for monitoring alerts |
 | `tf_state_bucket` | string | yes | `dfh-stage-tfstate` or `dfh-prod-tfstate` |
@@ -1091,6 +1157,57 @@ If a public-facing serving endpoint is provisioned (out-of-scope for this templa
 
 This template **does not** by default expose a public endpoint — fine-tuning is an internal workflow. The DNS names are reserved so the eventual serving deployment can claim them.
 
+### 12.6 Self-hosted Temporal on Cloud Run + Cloud SQL
+
+Temporal is **self-hosted in-project**. There is no Temporal Cloud dependency. The setup has three Terraform-provisioned pieces, all in the env's VPC:
+
+#### 12.6.1 Cloud SQL for PostgreSQL (persistence)
+
+| Field | Value |
+|---|---|
+| `database_version` | `POSTGRES_15` |
+| `tier` | `var.cloud_sql_tier` (default `db-custom-2-7680`) |
+| `disk_size` | `var.cloud_sql_disk_gb` GB SSD, autoresize on |
+| `availability_type` | `ZONAL` (stage), `REGIONAL` (prod) |
+| `backup_configuration` | enabled, 7-day retention |
+| `ip_configuration.private_network` | the env VPC (`module.networking.network_id`) |
+| `ip_configuration.ipv4_enabled` | `false` — **private IP only**, no public access |
+| Databases | `temporal` and `temporal_visibility` (created by Terraform) |
+| User | `temporal` with password from `random_password` → Secret Manager `temporal-postgres-password` |
+
+#### 12.6.2 Cloud Run **Service** — `temporal-server`
+
+| Field | Value |
+|---|---|
+| Image | `temporalio/auto-setup:1.25` (digest-pinned in `var.temporal_server_image`) |
+| Min instances | `1` (always-on; never scales to zero) |
+| Max instances | `1` for stage, `2` for prod |
+| CPU | `2` vCPU, **always-allocated** (`cpu_idle = false`) |
+| Memory | `2 GiB` |
+| Port | `7233` (gRPC frontend) — only used inside VPC |
+| Ingress | `INTERNAL` only (no internet ingress) |
+| VPC connector | `module.networking.connector_id`, egress `ALL_TRAFFIC` |
+| Env vars | `DB=postgres12`, `POSTGRES_SEEDS=<cloud-sql-private-ip>`, `DB_PORT=5432`, `POSTGRES_USER=temporal`, `POSTGRES_PWD=<secret-ref:temporal-postgres-password>`, `DBNAME=temporal`, `VISIBILITY_DBNAME=temporal_visibility`, `TEMPORAL_BROADCAST_ADDRESS=0.0.0.0`, `BIND_ON_IP=0.0.0.0` |
+| Service account | `temporal-server-<env>@<project>.iam.gserviceaccount.com` with `roles/secretmanager.secretAccessor` (scoped) and `roles/cloudsql.client` |
+| Internal DNS | Cloud Run-supplied URL is mapped via a private DNS zone entry `temporal-server.<env>.internal` → the service's run.app hostname (Cloud Run private networking resolves this from inside the VPC) |
+
+#### 12.6.3 Cloud Run **Job** — `temporal-worker` (and the client `submit_job.py`)
+
+- Image: built from `docker/worker.Dockerfile`, pushed to `us-central1-docker.pkg.dev/<project>/<app>/worker:<tag>`.
+- VPC connector: same as `temporal-server`.
+- Env vars include `TEMPORAL_ADDRESS=temporal-server.<env>.internal:7233`, `TEMPORAL_NAMESPACE=default`, `TEMPORAL_TASK_QUEUE=vertex-finetune-<env>`.
+- **No mTLS / API key** — connectivity is restricted to the VPC, secured at the network layer.
+- The worker connects to the Temporal server over **internal VPC DNS** (not public internet).
+
+#### 12.6.4 IAM additions
+
+Add to §7's IAM table:
+
+| SA (logical name) | Email pattern | Roles | Rationale |
+|---|---|---|---|
+| **`temporal-server`** | `temporal-server-<env>@…` | `roles/cloudsql.client`, `roles/secretmanager.secretAccessor` (scoped to `temporal-postgres-password`), `roles/logging.logWriter` | Cloud Run Service identity for the Temporal server. |
+| **`cloud-sql-temporal`** | `cloud-sql-temporal-<env>@…` (optional, for Cloud SQL Auth Proxy if used) | `roles/cloudsql.client` | Only created if Auth Proxy sidecar is enabled. |
+
 ---
 
 ## 13. Makefile targets
@@ -1125,9 +1242,10 @@ The `Makefile` provides a single source of truth for developer commands. All tar
 
 ```yaml
 # A single fine-tune campaign. This is what `make submit` reads.
+# This example is a REAL GPU run — see §14.1.b for the CPU-only smoke-test variant (the template default).
 job_name: invoices-llama3-8b-lora-v1
 model:
-  base_model_id: meta-llama/Llama-3.1-8B-Instruct
+  base_model_id: unsloth/Meta-Llama-3.1-8B-Instruct   # Unsloth quantized — no HF gating
   revision: main
 peft:
   type: lora
@@ -1151,6 +1269,7 @@ training:
   bf16: true
   gradient_checkpointing: true
 infrastructure:
+  use_gpu: true
   machine_type: a2-highgpu-1g
   accelerator_type: NVIDIA_TESLA_A100
   accelerator_count: 1
@@ -1161,11 +1280,11 @@ infrastructure:
 artifacts:
   output_uri: gs://dfh-stage-id-final-models/invoices-llama3-8b-lora-v1/
   checkpoint_uri: gs://dfh-stage-id-checkpoints/invoices-llama3-8b-lora-v1/
-  upload_hf_hub: false
+  upload_hf_hub: false               # if true, requires hf-token Secret Manager entry
   hf_repo_id: null
   hf_private: true
   register_in_vertex: true
-  prepare_serving_image: true
+  prepare_serving_image: true        # builds + pushes serving IMAGE only; does NOT deploy
 evaluation:
   min_eval_score: 0.65
   retry_on_low_score: true
@@ -1174,6 +1293,67 @@ notifications:
   slack_webhook_secret: projects/dfh-stage-id/secrets/slack-webhook/versions/latest
   email_to: null
 ```
+
+### 14.1.b Job YAML — CPU-only smoke-test (the default for CI)
+
+This variant exercises the entire workflow without consuming GPU. It is the only sane way to run an end-to-end test in CI.
+
+```yaml
+job_name: smoke-llama3-8b-cpu-v1
+model:
+  base_model_id: unsloth/Meta-Llama-3.1-8B-Instruct
+  revision: main
+peft:
+  type: lora
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  target_modules: [q_proj, v_proj]
+data:
+  raw_uri: gs://dfh-stage-id-raw-documents/invoices-tiny-smoke/
+  processed_uri: null
+  format: chat
+  train_split: 0.9
+  validation_split: 0.1
+training:
+  epochs: 1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 2e-4
+  max_seq_length: 512
+  bf16: false                        # CPU: use fp32
+  gradient_checkpointing: true
+infrastructure:
+  use_gpu: false                     # CPU-only (template default)
+  machine_type: n1-standard-8
+  accelerator_type: null
+  accelerator_count: 0
+  spot: false                        # IGNORED for CPU
+  fallback_on_demand: false
+  max_preemptions: 0
+  region: us-central1
+artifacts:
+  output_uri: gs://dfh-stage-id-final-models/smoke-llama3-8b-cpu-v1/
+  checkpoint_uri: gs://dfh-stage-id-checkpoints/smoke-llama3-8b-cpu-v1/
+  upload_hf_hub: false
+  register_in_vertex: true
+  prepare_serving_image: true
+evaluation:
+  min_eval_score: null
+notifications:
+  slack_webhook_secret: null
+  email_to: null
+```
+
+### 14.1.c Supported Unsloth base models
+
+| `base_model_id` | Family | Notes |
+|---|---|---|
+| `unsloth/Meta-Llama-3.1-8B-Instruct` | Llama 3.1 | Default; quantized, ungated, Apache 2.0 weights packaging |
+| `unsloth/mistral-7b-instruct-v0.3` | Mistral | Replaces `mistralai/Mistral-7B-Instruct-v0.3` |
+| `unsloth/Qwen2.5-7B-Instruct` | Qwen 2.5 | Replaces `Qwen/Qwen2.5-7B-Instruct` |
+
+Why Unsloth: ~2× faster QLoRA training, no Hugging Face access-request gating, redistributable under the upstream weights' license (Llama-3.1 Community License, Apache 2.0, etc.). HF_TOKEN is **only** needed when pushing fine-tuned adapters back to HF Hub.
 
 ### 14.2 Job YAML — JSON Schema validation
 
@@ -1187,16 +1367,10 @@ GCP_PROJECT_ID=dfh-stage-id
 GCP_REGION=us-central1
 ENVIRONMENT=stage
 
-# Temporal
-TEMPORAL_CLOUD=false
-TEMPORAL_ADDRESS=temporal-frontend.temporal.svc.cluster.local:7233
+# Temporal — self-hosted on Cloud Run + Cloud SQL. No Temporal Cloud variables.
+TEMPORAL_ADDRESS=temporal-server.stage.internal:7233
 TEMPORAL_NAMESPACE=default
 TEMPORAL_TASK_QUEUE=vertex-finetune-stage
-
-# Temporal Cloud (only if TEMPORAL_CLOUD=true)
-TEMPORAL_CLOUD_ADDRESS=
-TEMPORAL_CLOUD_NAMESPACE=
-TEMPORAL_CLOUD_API_KEY=
 
 # Optional integrations
 WANDB_PROJECT=
@@ -1209,6 +1383,50 @@ LOG_LEVEL=INFO
 ---
 
 ## 15. Monitoring & Alerting
+
+### 15.0 Training metrics — **Vertex AI TensorBoard only**
+
+This template uses **Vertex AI TensorBoard as the single source of truth for training metrics** (loss curves, eval scores, learning-rate schedules, gradient norms, sample tokens, etc.). There is no separate metrics serving endpoint deployed by this template.
+
+#### How metrics flow
+
+1. `train.py` constructs a Vertex AI TensorBoard logger via the official SDK:
+   ```python
+   from google.cloud import aiplatform
+   aiplatform.init(project=PROJECT_ID, location=REGION, experiment=EXPERIMENT_NAME)
+   tb = aiplatform.Tensorboard(TENSORBOARD_RESOURCE_NAME)  # from Terraform output
+   ```
+2. The `CustomJob`'s `job_spec.tensorboard` field (see §4.2) auto-uploads any logs written under `AIP_TENSORBOARD_LOG_DIR` to the configured TensorBoard instance — the in-container `TensorBoardCallback` simply writes summaries to that path.
+3. Per-step scalars (`train/loss`, `eval/loss`, `learning_rate`, `eval/score`) and a 5-sample text panel (`samples/generations` — input + model output) are emitted at `logging_steps` and `eval_steps` respectively.
+
+#### Accessing TensorBoard
+
+- **Instance resource name format:** `projects/<PROJECT_NUM>/locations/us-central1/tensorboards/<TB_NUMERIC_ID>` (Terraform output: `module.vertex_ai.tensorboard_resource_name`).
+- **Console URL pattern (per environment):**
+  - Staging: `https://console.cloud.google.com/vertex-ai/experiments/tensorboard-instances?project=dfh-stage-id`
+  - Production: `https://console.cloud.google.com/vertex-ai/experiments/tensorboard-instances?project=dfh-prod-id`
+- **Per-run URL pattern (one tab per workflow):**
+  `https://us-central1.tensorboard.googleusercontent.com/experiment/projects+<PROJECT_NUM>+locations+us-central1+tensorboards+<TB_ID>+experiments+<EXPERIMENT_ID>/`
+- **Programmatic access (`google-cloud-aiplatform`):**
+  ```python
+  experiment = aiplatform.Experiment.get(EXPERIMENT_NAME)
+  runs = aiplatform.ExperimentRun.list(experiment=experiment)
+  print(runs[0].get_metrics())   # dict of {scalar_name: value}
+  ```
+
+#### Metrics visible in TensorBoard
+
+| Tag | Type | Cadence |
+|---|---|---|
+| `train/loss` | scalar | every `logging_steps` (default 50) |
+| `train/learning_rate` | scalar | every `logging_steps` |
+| `train/grad_norm` | scalar | every `logging_steps` |
+| `eval/loss` | scalar | every `eval_steps` / end of epoch |
+| `eval/score` | scalar | end of epoch (matches `eval_score.json`) |
+| `samples/generations` | text | first eval step + every 500 train steps |
+| `system/cpu_util` / `system/gpu_util` | scalar | every 30 s (CustomJob built-in) |
+
+> **No serving endpoint = no serving metrics.** Because this template does not deploy a serving endpoint, no inference latency / QPS / token-rate metrics are emitted. Those belong to the downstream serving template that consumes the image we push to Artifact Registry.
 
 ### 15.1 Metrics emitted by the worker
 
@@ -1260,8 +1478,10 @@ A single Cloud Monitoring dashboard `Finetune Overview` shipping in `modules/mon
 5. **Single replica.** No multi-node by default — only added by config for 70B-class training.
 6. **Vertex AI base output directory + checkpoint resume** means preempted Spot jobs don't waste prior progress.
 7. **Artifact Registry vulnerability scanning** on demand (cost ~$0.10 per image per scan); enabled in CI only at release.
-8. **Cloud Run worker scales to zero** when no workflows are running (Cloud Run Job model: invocation-based).
+8. **Cloud Run worker scales to zero** when no workflows are running (Cloud Run **Job** model: invocation-based).
 9. **Logs sampled.** Training logs at INFO; DEBUG only in `debug.yaml` training profile.
+10. **Temporal server fixed cost.** The self-hosted Temporal Cloud Run **Service** runs `min-instances=1` (always-on), so it is a fixed ~$10–20 / env / month. Cloud SQL (`db-custom-2-7680`, 20 GB SSD) adds ~$50–70 / env / month. This is the single biggest standing cost in the template and the reason the Temporal Cloud option was considered (and rejected — see §19.1).
+11. **No serving runtime cost.** Because the template does not deploy a serving endpoint, there is no idle inference compute. The serving image's storage in Artifact Registry is cents per GB.
 
 ### 16.2 Cost monitoring
 
@@ -1273,6 +1493,7 @@ A single Cloud Monitoring dashboard `Finetune Overview` shipping in `modules/mon
 
 | Workload | Machine | Duration | Spot? | Rough cost (USD) |
 |---|---|---|---|---|
+| **CPU smoke test** (10 rows, 1 epoch) | `n1-standard-8` | ~10 min | n/a | < $0.10 |
 | 8B LoRA SFT, 50k rows | 1× A100 40GB | 2 h | yes | ~$3–6 |
 | 8B LoRA SFT, 50k rows | 1× A100 40GB | 2 h | no | ~$8–12 |
 | 8B QLoRA SFT, 200k rows | 1× L4 24GB | 6 h | yes | ~$2–4 |
@@ -1291,7 +1512,7 @@ A single Cloud Monitoring dashboard `Finetune Overview` shipping in `modules/mon
 - **Bucket IAM is per-bucket** — never project-level `objectAdmin`.
 - **Secret Manager** for HF_TOKEN, WANDB_API_KEY, Temporal credentials. Vertex AI auto-resolves secret refs in env vars; secrets never appear in container args, logs, or workflow histories.
 - **Container images are private** — Artifact Registry repos with `allUsers` access denied. Vulnerability scanning enabled.
-- **VPC + Private Service Access** is supported (off by default; opt-in via `var.vpc_enabled`). When enabled, Vertex AI CustomJob uses peering to access Cloud Storage and Secret Manager via private endpoints.
+- **VPC + Private Service Access is mandatory** (required to host the self-hosted Temporal server + Cloud SQL with private IP). Workers and the Temporal server attach to the VPC via a Serverless VPC Access connector. Vertex AI CustomJob optionally peers into the same VPC for private Cloud Storage and Secret Manager access.
 - **Audit logging.** Data Access audit logs enabled for Secret Manager and GCS in prod (off in stage to control cost).
 - **No HF_TOKEN in workflow input.** Always referenced by Secret Manager resource name, never as a plain value in the `FineTuneRequest`.
 - **Customer data isolation.** Each fork of this template lives in a dedicated GCP project; cross-project IAM bindings are forbidden.
@@ -1334,13 +1555,14 @@ A single Cloud Monitoring dashboard `Finetune Overview` shipping in `modules/mon
 
 ### 19.1 Temporal vs. Cloud Workflows / Argo / step-functions equivalents
 
-**Decision:** Temporal.
-**Why:** Durable execution, first-class long-running activities with heartbeats, mature Python SDK, can target both Temporal Cloud (managed) and self-hosted clusters. Cloud Workflows lacks polling-with-heartbeat ergonomics for >1h Vertex jobs and ties us to GCP. Argo would require a GKE cluster just for the orchestrator.
+**Decision:** Temporal — **self-hosted on Cloud Run + Cloud SQL for PostgreSQL** (no Temporal Cloud dependency).
+**Why:** Durable execution, first-class long-running activities with heartbeats, mature Python SDK. Cloud Workflows lacks polling-with-heartbeat ergonomics for >1h Vertex jobs and ties us to GCP. Argo would require a GKE cluster just for the orchestrator.
+**Why self-hosted, not Temporal Cloud:** No third-party SaaS dependency, no egress / API-key / mTLS rotation overhead, cost-stable (a min-instances=1 Cloud Run Service + a small Cloud SQL is single-digit USD per env per month at this throughput), and all traffic stays inside the GCP project's VPC. The trade-off — operating our own Postgres-backed Temporal — is paid by Terraform; the maintenance surface is two Cloud Run revisions and a managed Cloud SQL instance.
 
 ### 19.2 Cloud Run Job vs. Cloud Run Service for the worker
 
-**Decision:** Cloud Run **Job** (executed on a schedule or one-shot by Cloud Scheduler), with the option to switch to Cloud Run **Service** (long-poll) when workflow throughput is high enough to justify keeping a worker warm.
-**Why:** Most fine-tuning shops run < 10 workflows/day. Cloud Run Job's pay-per-execution model is cheaper at this scale. The worker code is the same in both modes — the only difference is the entrypoint loop (one-shot vs. forever).
+**Decision:** Cloud Run **Job** for the **worker** (one-shot per workflow, pay-per-execution), and Cloud Run **Service** for the **Temporal server** (always-on, min-instances=1).
+**Why:** Most fine-tuning shops run < 10 workflows/day; the worker's pay-per-execution model is cheaper at this scale, and the worker code is the same shape in both modes. The Temporal server, however, must always be reachable for clients and workers — hence a Service with `min-instances=1` and `cpu_idle=false`.
 
 ### 19.3 Vertex AI CustomJob vs. GKE training pods
 
@@ -1382,33 +1604,53 @@ A single Cloud Monitoring dashboard `Finetune Overview` shipping in `modules/mon
 **Decision:** Forbidden by config validator.
 **Why:** Python `re.findall(r"", "abc")` returns `["", "", "", ""]` (length 4) — a footgun for anyone parsing logs. The validator rejects empty patterns with a clear message.
 
+### 19.11 Unsloth-quantized base models as default
+
+**Decision:** All shipped configs use `unsloth/<...>` model IDs. `unsloth` is a required dependency in `training/requirements.txt`.
+**Why:** (a) **No HF Hub gating** — Unsloth's mirrors of Llama 3.1, Mistral 7B, and Qwen 2.5 are not behind access-request walls, eliminating the HF-token-procurement blocker for new forks. (b) **~2× faster QLoRA training** via Unsloth's custom CUDA kernels at no quality cost. (c) **Apache 2.0 packaging** of upstream weights, redistributable for our customer-facing template. HF_TOKEN becomes optional — only needed when pushing fine-tuned adapters back to HF Hub.
+
+### 19.12 CPU-only default, GPU as opt-in via `use_gpu`
+
+**Decision:** `infrastructure.use_gpu=false` is the default. CPU-only runs use `n1-standard-8`. GPU runs (`use_gpu=true`) provision `a2-highgpu-1g + NVIDIA_TESLA_A100`.
+**Why:** The template is meant to be deployable and exercised end-to-end without GPU quota — CI smoke tests, template development, and fork validation should not block on Vertex AI A100 capacity in `us-central1`. Production training of 7B+ models is impractical on CPU and the train.py startup must emit a prominent warning when `use_gpu=false` is paired with such a model. Spot fallback logic is collapsed to a single STANDARD submission when CPU is selected (no Spot discount for CPU CustomJobs).
+
+### 19.13 No serving endpoint; serving image only
+
+**Decision:** Step 8 (`prepare_serving_artifacts`) **builds and pushes** the serving container image to Artifact Registry. It does **not** deploy that image to any runtime.
+**Why:** Serving is a long-lived, stateful concern with distinct SLOs, scaling, and security boundary. Mixing deployment into a fine-tuning template would dilute both ownership and the per-template's blast radius. The serving deployment is the consumer of this template — see `gcp-cloudrun-template` or `gcp-clouddeploy-gke-template`. Training metrics live in **Vertex AI TensorBoard** (§15.0), the single source of truth for this template's observability.
+
 ---
 
 ## 20. Open Questions / Risks
 
-1. **Temporal Cloud vs. self-hosted** — the template supports both; the operator chooses via `var.temporal_cloud`. The default in `terraform/stage/terraform.tfvars` is `true` to avoid running a Temporal cluster in stage. The DevOps Engineer must document which path is chosen in `README.md`.
-2. **HF gated model access** — Llama 3.1 requires HF Hub access approval. The operator must request access at fork time and populate `hf-token` before running any Llama job.
-3. **70B-class jobs** — require either A100 80GB ×4 or H100 ×8; quotas must be requested in advance. The default machine type targets 8B; the operator overrides per-job.
-4. **Region availability** — Spot A100 availability is region-dependent. The template defaults to `us-central1`, where capacity is generally good. For other regions, the fallback path should be tested in stage.
+1. **HF token only needed for upload-back** — Unsloth base models are ungated, so the `hf-token` secret is **optional** and only required when `artifacts.upload_hf_hub=true`. Operators pushing private fine-tuned adapters must still provision it.
+2. **70B-class jobs** — require either A100 80GB ×4 or H100 ×8; quotas must be requested in advance. The default machine type targets the CPU smoke path; operators must set `use_gpu=true` AND override the machine spec per-job.
+3. **Region availability** — Spot A100 availability is region-dependent. The template defaults to `us-central1`, where capacity is generally good. For other regions, the fallback path should be tested in stage. Cloud SQL and the Temporal Cloud Run Service are also single-region per env.
+4. **Cloud SQL maintenance windows** — the self-hosted Temporal server depends on Cloud SQL availability. DevOps must configure maintenance windows outside peak workflow hours; workflow clients should retry on `Unavailable` from Temporal.
+5. **VPC connector throughput** — Serverless VPC Access connectors have throughput caps (default 200 MB/s, scaling to 1000 MB/s). For this template's load (RPC, no bulk data) the default is fine, but DevOps should monitor `serverlessvpcaccess.googleapis.com/connector/sent_bytes_count`.
 
 ---
 
 ## 21. Quality Self-Check (Architect, before delivery)
 
 - [x] Every workflow step has input/output contracts, retry policies, heartbeat behaviour, and edge cases.
-- [x] Vertex AI CustomJob spec is concrete (machine_type, scheduling, env, output prefix).
+- [x] Vertex AI CustomJob spec is concrete for **both** CPU-only (default) and GPU configurations (§4.1).
 - [x] GCS bucket layout is enumerated with IAM, lifecycle, versioning.
-- [x] IAM bindings are per-bucket, per-SA, with rationale.
-- [x] Secret Manager secrets are listed with consumers.
+- [x] IAM bindings are per-bucket, per-SA, with rationale, including the new `temporal-server` SA.
+- [x] Secret Manager secrets are listed with consumers; HF_TOKEN documented as optional; Temporal Cloud secrets removed.
 - [x] Cloud Build YAMLs are illustrated with substitutions and SAs.
 - [x] GitHub Actions versions match `template-standards.md` (no `@v3` or older for the listed actions).
 - [x] Terraform version pinned `>= 1.6`.
 - [x] Pre-deploy resource conflict check in CI documented.
 - [x] Bulk delete uses `BulkWriter` (Firestore) and batched `delete_blobs` (GCS) — deprecated `Batch()` is explicitly forbidden.
-- [x] Concrete JSON / YAML examples for the workflow input, output, failure payload, job config, JSONL formats.
+- [x] Concrete JSON / YAML examples for the workflow input, output, failure payload, job config (GPU **and** CPU smoke variants), JSONL formats.
 - [x] Edge cases for data prep (empty, single, all-empty, duplicates, tokenizer failures) documented.
-- [x] Spot VM fallback flow documented (decision diagram).
-- [x] Cost table and security threat model included.
+- [x] Spot VM fallback flow documented (decision diagram); Spot disabled when `use_gpu=false`.
+- [x] Cost table and security threat model included; CPU smoke row added.
+- [x] Self-hosted Temporal on Cloud Run + Cloud SQL fully specified (§12.6).
+- [x] Unsloth base models documented (§14.1.c) and rationale captured (§19.11).
+- [x] Vertex AI TensorBoard documented as the single source of training metrics (§15.0).
+- [x] Out-of-scope statement: this template builds + pushes the serving image only; no endpoint is deployed (§1.1, §19.13).
 - [x] No application code written (no `.py`, `.tf`, `.yaml` files produced — those are the implementing teams').
 
 — *End of ARCHITECTURE.md* —

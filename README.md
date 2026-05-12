@@ -2,7 +2,7 @@
 
 **Production-grade template for automated supervised fine-tuning of open-source LLMs on Google Cloud Platform.**
 
-> Fork this repository once per domain or customer. Drop raw documents into a GCS bucket, submit a job config, and a Temporal workflow handles data prep → image build → Vertex AI training (Spot, with fallback) → checkpointing → model registry → Hugging Face Hub → serving image — durably and cost-efficiently.
+> Fork this repository once per domain or customer. Drop raw documents into a GCS bucket, submit a job config, and a self-hosted Temporal workflow handles data prep → image build → Vertex AI training (CPU by default, GPU + Spot when `use_gpu=true`) → checkpointing → model registry → optional Hugging Face Hub push → **serving image build & push** (deployment is out of scope) — durably and cost-efficiently.
 
 ---
 
@@ -29,14 +29,16 @@
 
 | Capability | Implementation |
 |---|---|
-| **Durable orchestration** | Temporal workflow with heartbeats, retries, conditional re-training |
-| **Managed training** | Vertex AI `CustomJob` with **Spot VMs + On-Demand fallback** |
-| **Multi-model** | Llama 3.1 8B/70B, Mistral 7B, Qwen 2.5 7B/14B (any HF causal LM works) |
-| **Cost-optimised** | LoRA / QLoRA defaults, Spot first, GCS lifecycle rules |
+| **Durable orchestration** | **Self-hosted Temporal** on Cloud Run + Cloud SQL for PostgreSQL — no Temporal Cloud dependency |
+| **Managed training** | Vertex AI `CustomJob` — **CPU-only `n1-standard-8` by default**, switch to A100 with `use_gpu: true` |
+| **Spot fallback (GPU only)** | When `use_gpu=true`, Spot VMs are used first with automatic On-Demand fallback |
+| **Multi-model — Unsloth quantized** | `unsloth/Meta-Llama-3.1-8B-Instruct`, `unsloth/mistral-7b-instruct-v0.3`, `unsloth/Qwen2.5-7B-Instruct` — **no HF gating**, ~2× faster QLoRA |
+| **Cost-optimised** | LoRA / QLoRA defaults, Spot for GPU, GCS lifecycle rules |
 | **Reproducible** | Hydra configs, digest-pinned images, deterministic data splits |
-| **Production observability** | Cloud Logging, Vertex AI TensorBoard, optional W&B, Cloud Monitoring alerts |
-| **Secure by default** | Workload Identity, Secret Manager, private Artifact Registry, optional VPC |
+| **Training metrics → Vertex AI TensorBoard** | Per-run scalars (`train/loss`, `eval/loss`, `eval/score`) and text samples; no separate metrics serving endpoint |
+| **Secure by default** | Workload Identity, Secret Manager, private Artifact Registry, **VPC + private IP Cloud SQL (mandatory)** |
 | **Two-env deploy** | `terraform/stage/` and `terraform/prod/` with shared modules |
+| **Serving image build (no deploy)** | Step 8 builds + pushes the vLLM serving image to Artifact Registry; **deploying it is out of scope** — see `gcp-cloudrun-template` or `gcp-clouddeploy-gke-template` |
 
 ---
 
@@ -61,8 +63,10 @@ flowchart LR
             CRJOB["Cloud Run Job<br/>(temporal/worker.py)"]
         end
 
-        subgraph Orchestration["Orchestration"]
-            TEMPORAL["Temporal Cloud<br/>or self-hosted cluster"]
+        subgraph Orchestration["Orchestration (self-hosted)"]
+            TEMPORAL_SVC["Cloud Run Service<br/>temporal-server<br/>(min-instances=1, VPC-only)"]
+            CSQL[("Cloud SQL Postgres<br/>(temporal + temporal_visibility)")]
+            TEMPORAL_SVC <--> CSQL
         end
 
         subgraph CI["Build"]
@@ -84,7 +88,7 @@ flowchart LR
         end
 
         subgraph Security["Security & Config"]
-            SM["Secret Manager<br/>(HF_TOKEN, WANDB, Temporal creds)"]
+            SM["Secret Manager<br/>(temporal-postgres-password,<br/>HF_TOKEN [optional], WANDB [optional])"]
             IAM["IAM<br/>(per-SA, per-bucket)"]
         end
 
@@ -104,7 +108,7 @@ flowchart LR
     SCHED --> CRJOB
     EVENTARC --> CRJOB
     GCS_RAW -.->|object created| EVENTARC
-    CRJOB <-->|workflows| TEMPORAL
+    CRJOB <-->|gRPC over VPC<br/>temporal-server.&lt;env&gt;.internal:7233| TEMPORAL_SVC
     CRJOB -->|submit CustomJob| VAI
     VAI -->|pulls image| AR
     VAI -->|read| GCS_PROC
@@ -247,9 +251,9 @@ sequenceDiagram
 2. Two Terraform state buckets:
    - `gs://dfh-stage-tfstate`
    - `gs://dfh-prod-tfstate`
-3. Quota for **NVIDIA A100 40GB** in `us-central1` for staging (≥ 1 GPU). For 70B-class jobs you also need A100 80GB ×4 or H100 ×8.
-4. Cloud DNS zone `demo-devops-for-hire-com` in `dfh-ops-id`.
-5. Hugging Face account with access to any **gated** base models (e.g. Llama 3.1). Generate a User Access Token at https://huggingface.co/settings/tokens.
+3. Cloud DNS zone `demo-devops-for-hire-com` in `dfh-ops-id`.
+4. **Hugging Face is optional.** Default base models are Unsloth quantized (ungated, Apache 2.0). You only need an HF account + User Access Token if you set `artifacts.upload_hf_hub: true` to push your fine-tuned adapter back to HF Hub. Tokens: https://huggingface.co/settings/tokens.
+5. **GPU quota is optional for the CPU-only smoke path.** For real GPU training, request **NVIDIA A100 40GB** quota in `us-central1` (≥ 1 GPU); 70B-class jobs need A100 80GB ×4 or H100 ×8.
 
 ### GitHub secrets
 
@@ -302,19 +306,25 @@ gsutil -m cp -r ./examples/invoices/*.pdf \
 ### 3. Submit a fine-tune workflow
 
 ```bash
+# CPU-only smoke test (template default — recommended first run):
+make submit ENV=stage CONFIG=configs/jobs/smoke_llama3_8b_cpu.yaml
+
+# Real GPU run (requires A100 quota in us-central1):
 make submit ENV=stage CONFIG=configs/jobs/invoices_llama3_8b_lora.yaml
 ```
 
 This prints a workflow ID like `ft-9a3b1c7e-20260512-141022`.
+
+> **CPU vs. GPU.** The default `infrastructure.use_gpu` is **`false`** — runs on `n1-standard-8`. This exercises the entire workflow plumbing (data prep → submit → monitor → save → register → serving-image build) without consuming GPU quota. It is **not** suitable for training models >1B params for real use — set `use_gpu: true` for that.
 
 ### 4. Follow along
 
 ```bash
 make tail ENV=stage WORKFLOW=ft-9a3b1c7e-20260512-141022
 # Also:
-#  - Temporal UI:  https://cloud.temporal.io/...   (or self-hosted address)
-#  - Vertex AI UI: https://console.cloud.google.com/vertex-ai/training/custom-jobs
-#  - TensorBoard:  https://console.cloud.google.com/vertex-ai/experiments/tensorboard-instances
+#  - Temporal Web UI: VPC-only — see "Worker can't reach Temporal" troubleshooting
+#  - Vertex AI UI:    https://console.cloud.google.com/vertex-ai/training/custom-jobs
+#  - TensorBoard:     https://console.cloud.google.com/vertex-ai/experiments/tensorboard-instances
 ```
 
 ### 5. Inspect outputs
@@ -345,14 +355,15 @@ Key knobs you'll edit most often:
 
 | Path | Default | When to change |
 |---|---|---|
-| `model.base_model_id` | `meta-llama/Llama-3.1-8B-Instruct` | Switch base model |
+| `model.base_model_id` | `unsloth/Meta-Llama-3.1-8B-Instruct` | Switch to `unsloth/mistral-7b-instruct-v0.3` or `unsloth/Qwen2.5-7B-Instruct` |
 | `peft.type` | `lora` | `qlora` for tighter memory; `none` for full fine-tune |
 | `peft.lora_r` | `16` | `8` for tiny adapters, `32–64` for higher capacity |
 | `training.epochs` | `3` | More epochs for small datasets; watch eval loss |
 | `training.learning_rate` | `2e-4` (LoRA) | Lower for larger models or noisy data |
 | `training.max_seq_length` | `4096` | Match your data's typical length; longer = more VRAM |
-| `infrastructure.machine_type` | `a2-highgpu-1g` | `g2-standard-12` (L4) for cheap QLoRA; multi-GPU for 70B |
-| `infrastructure.spot` | `true` | `false` for time-critical jobs |
+| `infrastructure.use_gpu` | `false` | **`true`** to run on A100 — required for any real (>1B param) training |
+| `infrastructure.machine_type` | `n1-standard-8` (CPU) | `a2-highgpu-1g` (A100) when `use_gpu=true`; `g2-standard-12` (L4) for cheap QLoRA |
+| `infrastructure.spot` | `true` | Ignored when `use_gpu=false`; `false` for time-critical GPU jobs |
 | `infrastructure.max_preemptions` | `2` | Higher in spot-heavy regions; `0` to never tolerate preemption |
 | `evaluation.min_eval_score` | `null` | Set to gate auto-retry |
 
@@ -442,12 +453,14 @@ Spot capacity unavailable in the region. Choices:
 
 ### "HF Hub: 401 Unauthorized"
 
+You will only ever see this on the **upload-back** path (`artifacts.upload_hf_hub=true`) — Unsloth base model downloads are ungated. Fix:
+
 - `hf-token` secret is missing or expired. Recreate:
   ```bash
   printf 'hf_xxx_your_new_token' | gcloud secrets versions add hf-token \
     --project=dfh-stage-id --data-file=-
   ```
-- For Llama 3.1 / other gated models, you must request access on the model's HF page **and** the token must belong to that approved user.
+- Confirm the HF user owns (or has write access to) the target `hf_repo_id`.
 
 ### "Workflow says `succeeded` but model isn't in Model Registry"
 
@@ -461,8 +474,12 @@ Check `Pre-deploy resource conflict check` step output. If a resource exists out
 
 ### "Worker can't reach Temporal"
 
-- For Temporal Cloud: confirm `temporal-api-key`, `temporal-tls-cert`, `temporal-tls-key` secrets exist and the namespace mTLS config matches.
-- For self-hosted: confirm the worker's Cloud Run Job has VPC connector access to the Temporal service.
+Temporal is self-hosted on Cloud Run + Cloud SQL. Check, in order:
+
+1. The Cloud Run **Service** `temporal-server-<env>` is healthy: `gcloud run services describe temporal-server-<env> --region=us-central1 --project=dfh-<env>-id`.
+2. The Cloud SQL Postgres instance is `RUNNABLE` and has private IP only.
+3. The worker Cloud Run **Job** has a VPC connector attached (`vpc_access.connector`) and `TEMPORAL_ADDRESS=temporal-server.<env>.internal:7233` in its env.
+4. The private DNS zone resolves `temporal-server.<env>.internal` from inside the VPC — test from a Cloud Shell with VPC peering: `nslookup temporal-server.stage.internal`.
 
 ### "Eval score is `null`"
 
@@ -477,7 +494,9 @@ Your dataset has no validation rows (e.g. `validation_split` was effectively 0).
 | **Staging** | `gcp-vertex-ai-jobs-template.stage.demo.devops-for-hire.com` | `stage` | `dfh-stage-id` | `gs://dfh-stage-tfstate/gcp-vertex-ai-jobs-template/state` |
 | **Production** | `gcp-vertex-ai-jobs-template.demo.devops-for-hire.com` | `main` | `dfh-prod-id` | `gs://dfh-prod-tfstate/gcp-vertex-ai-jobs-template/state` |
 
-> Note: this template **prepares** a serving image but does not by default deploy a public endpoint. The DNS names are reserved for the downstream serving deployment (see `gcp-cloudrun-template` or `gcp-clouddeploy-gke-template`).
+> Note: this template **builds and pushes** a serving image to Artifact Registry but **does not deploy** any serving endpoint. The DNS names above are reserved for whatever downstream serving deployment consumes the image (see `gcp-cloudrun-template` or `gcp-clouddeploy-gke-template`).
+>
+> Training metrics live in **Vertex AI TensorBoard** for the env's project (linked above). No separate metrics endpoint is deployed.
 
 Other operational URLs:
 
@@ -486,7 +505,7 @@ Other operational URLs:
 - **TensorBoard (stage):** https://console.cloud.google.com/vertex-ai/experiments/tensorboard-instances?project=dfh-stage-id
 - **Cloud Build (stage):** https://console.cloud.google.com/cloud-build/builds?project=dfh-stage-id
 - **Cloud Logging (stage):** https://console.cloud.google.com/logs/query?project=dfh-stage-id
-- **Temporal UI:** depends on deployment (Temporal Cloud or in-cluster URL — set in `.env`)
+- **Temporal Web UI:** the self-hosted server's Web UI is **not exposed publicly** (VPC-only). To reach it, either deploy `temporalio/web` as a sidecar Service in the same VPC or `gcloud run services proxy temporal-server-<env> --port=8233` and tunnel to `localhost:8233`.
 
 ---
 
