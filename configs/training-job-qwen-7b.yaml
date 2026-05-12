@@ -1,1 +1,70 @@
-# TODO: training job config for Qwen-7B (LoRA, A100 single GPU)
+# Fine-tune campaign: Qwen 2.5 7B Instruct with LoRA on a single A100.
+# CPU-only default — flip infrastructure.use_gpu to true for a real GPU run.
+# See §14.1.c of ARCHITECTURE.md for the unsloth/Qwen2.5-7B-Instruct model ID.
+
+job_name: qwen-7b-lora-v1
+
+model:
+  base_model_id: unsloth/Qwen2.5-7B-Instruct  # replaces Qwen/Qwen2.5-7B-Instruct
+  revision: main
+
+peft:
+  type: lora
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  bias: none
+  merge_after_training: false
+
+data:
+  raw_uri: gs://BUCKET-raw-documents/qwen-7b-lora-v1/
+  processed_uri: null
+  format: chat
+  train_split: 0.95
+  validation_split: 0.05
+
+training:
+  epochs: 3
+  per_device_batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.03
+  max_seq_length: 4096
+  bf16: true           # use fp32 (bf16: false) when use_gpu: false
+  gradient_checkpointing: true
+
+infrastructure:
+  use_gpu: false                # set true for production runs
+  machine_type: n1-standard-8  # when use_gpu: true → a2-highgpu-1g
+  accelerator_type: null        # when use_gpu: true → NVIDIA_TESLA_A100
+  accelerator_count: 0          # when use_gpu: true → 1
+  spot: true                    # ignored when use_gpu: false
+  fallback_on_demand: true
+  max_preemptions: 2
+  region: us-central1
+
+artifacts:
+  output_uri: gs://BUCKET-final-models/qwen-7b-lora-v1/
+  checkpoint_uri: gs://BUCKET-checkpoints/qwen-7b-lora-v1/
+  upload_hf_hub: false
+  hf_repo_id: null
+  hf_private: true
+  register_in_vertex: true
+  prepare_serving_image: true
+
+evaluation:
+  min_eval_score: 0.65
+  retry_on_low_score: true
+  retry_lr_multiplier: 0.5
+
+notifications:
+  slack_webhook_secret: null
+  email_to: null

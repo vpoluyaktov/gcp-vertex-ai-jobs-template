@@ -1,1 +1,47 @@
-# TODO: default training hyperparameters (model name, dataset path, lora config, batch size, learning rate, epochs)
+# Default training hyperparameters for template/CI smoke-test runs.
+# Override per-model via configs/training-job-*.yaml job configs.
+# See §14.1.b of ARCHITECTURE.md for the CPU-only smoke-test configuration.
+
+base_model: unsloth/Meta-Llama-3.1-8B-Instruct
+
+# CPU-only is the template default (§4.4).
+# Set use_gpu: true for any real fine-tuning workload.
+use_gpu: false
+
+lora:
+  type: lora
+  r: 16
+  lora_alpha: 32
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  lora_dropout: 0.05
+  bias: none
+  merge_after_training: false
+
+training:
+  num_train_epochs: 3
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-4
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.05
+  max_seq_length: 2048
+  fp16: false
+  bf16: false
+  logging_steps: 50
+  save_steps: 500
+  eval_steps: 500
+
+data:
+  gcs_input_path: gs://BUCKET/processed-datasets/
+  gcs_output_dir: gs://BUCKET/checkpoints/
+  chat_template: llama-3
+
+# Vertex AI TensorBoard resource name (injected by Terraform output at deploy time)
+# tensorboard_resource_name: projects/PROJECT_NUM/locations/us-central1/tensorboards/TB_ID

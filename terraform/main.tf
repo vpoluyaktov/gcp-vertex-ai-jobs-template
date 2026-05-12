@@ -13,7 +13,10 @@
 #   terraform apply tfplan
 #
 # Auth uses GCP_STAGE_SA_KEY for the stage branch, GCP_PROD_SA_KEY for main.
-# Module wiring follows ARCHITECTURE.md §12.1; module bodies are TODO today.
+# Modules currently wired: apis, networking, gcs, iam, artifact_registry.
+# Still TODO (per ARCHITECTURE.md §12.1): secret_manager, cloud_sql,
+# temporal_server, vertex_ai, cloud_run_worker, cloud_build, scheduler,
+# monitoring.
 ###############################################################################
 
 provider "google" {
@@ -26,59 +29,127 @@ provider "google-beta" {
   region  = var.region
 }
 
-# Built-in sentinel — keeps `terraform plan` producing a non-empty graph until
-# the real modules land. Uses terraform_data so no extra provider is required.
-# Safe to remove once any real module is wired in below.
-resource "terraform_data" "scaffold_sentinel" {
-  input = {
-    environment = var.environment
-    app_name    = var.app_name
-    project_id  = var.project_id
+# Common labels merged onto every labelable resource that supports them.
+locals {
+  common_labels = {
+    app = var.app_name
+    env = var.environment
   }
 }
 
-# TODO(devops): wire modules per ARCHITECTURE.md §12.1 once module variables
-# are defined. Mandatory apply order (enforced by depends_on per §12.1):
+# -----------------------------------------------------------------------------
+# Networking — no upstream deps. Other modules (cloud_sql, temporal_server,
+# cloud_run_worker) depend on its outputs.
+# -----------------------------------------------------------------------------
+
+module "networking" {
+  source = "./modules/networking"
+
+  project_id         = var.project_id
+  region             = var.region
+  app_name           = var.app_name
+  environment        = var.environment
+  vpc_cidr           = var.vpc_cidr
+  vpc_connector_cidr = var.vpc_connector_cidr
+  labels             = local.common_labels
+
+  depends_on = [google_project_service.apis]
+}
+
+# -----------------------------------------------------------------------------
+# GCS — 7 buckets per ARCHITECTURE.md §6.
+# -----------------------------------------------------------------------------
+
+module "gcs" {
+  source = "./modules/gcs"
+
+  project_id  = var.project_id
+  app_name    = var.app_name
+  environment = var.environment
+  labels      = local.common_labels
+
+  depends_on = [google_project_service.apis]
+}
+
+# -----------------------------------------------------------------------------
+# IAM — 7 SAs per §7, scoped bucket bindings per §7.2, optional WIF per §7.1.
+# Depends on gcs because storage IAM is bucket-scoped (§7.2).
+# -----------------------------------------------------------------------------
+
+module "iam" {
+  source = "./modules/iam"
+
+  project_id   = var.project_id
+  app_name     = var.app_name
+  environment  = var.environment
+  bucket_names = module.gcs.bucket_names
+  github_repo  = "vpoluyaktov/${var.app_name}"
+
+  depends_on = [google_project_service.apis]
+}
+
+# -----------------------------------------------------------------------------
+# Artifact Registry — 2 Docker repos with scoped per-repo IAM.
+# -----------------------------------------------------------------------------
+
+module "artifact_registry" {
+  source = "./modules/artifact_registry"
+
+  project_id          = var.project_id
+  region              = var.region
+  app_name            = var.app_name
+  environment         = var.environment
+  labels              = local.common_labels
+  training_sa_email   = module.iam.training_sa_email
+  serving_sa_email    = module.iam.serving_sa_email
+  cloudbuild_sa_email = module.iam.cloudbuild_sa_email
+  worker_sa_email     = module.iam.worker_sa_email
+
+  depends_on = [google_project_service.apis]
+}
+
+# -----------------------------------------------------------------------------
+# TODO (next tasks): wire the remaining modules.
+# Mandatory apply order (enforced by depends_on per §12.1):
 #   networking → cloud_sql → temporal_server → cloud_run_worker
 # Full sequence:
 #   networking → gcs → iam → artifact_registry → secret_manager
 #   → cloud_sql → temporal_server → vertex_ai → cloud_run_worker
 #   → cloud_build → scheduler → monitoring
 #
-# module "networking" {
-#   source             = "./modules/networking"
-#   project_id         = var.project_id
-#   app_name           = var.app_name
-#   environment        = var.environment
-#   region             = var.region
-#   vpc_cidr           = var.vpc_cidr
-#   vpc_connector_cidr = var.vpc_connector_cidr
+# module "secret_manager" {
+#   source                  = "./modules/secret_manager"
+#   project_id              = var.project_id
+#   app_name                = var.app_name
+#   environment             = var.environment
+#   enable_w_and_b          = var.enable_w_and_b
+#   temporal_server_sa_email = module.iam.service_account_emails["worker"] # placeholder
 # }
 #
 # module "cloud_sql" {
-#   source            = "./modules/cloud_sql"
-#   project_id        = var.project_id
-#   app_name          = var.app_name
-#   environment       = var.environment
-#   region            = var.region
-#   tier              = var.cloud_sql_tier
-#   disk_gb           = var.cloud_sql_disk_gb
-#   private_network   = module.networking.vpc_self_link
-#   depends_on        = [module.networking]
+#   source             = "./modules/cloud_sql"
+#   project_id         = var.project_id
+#   region             = var.region
+#   app_name           = var.app_name
+#   environment        = var.environment
+#   tier               = var.cloud_sql_tier
+#   disk_gb            = var.cloud_sql_disk_gb
+#   network_self_link  = module.networking.network_self_link
+#   psa_dependency     = module.networking.private_service_connection
+#   db_password_secret = module.secret_manager.temporal_postgres_password_secret_id
 # }
 #
 # module "temporal_server" {
-#   source             = "./modules/temporal_server"
-#   project_id         = var.project_id
-#   app_name           = var.app_name
-#   environment        = var.environment
-#   region             = var.region
-#   image              = var.temporal_server_image
-#   temporal_namespace = var.temporal_namespace
-#   cloud_sql_instance = module.cloud_sql.instance_connection_name
-#   db_password_secret = module.secret_manager.temporal_postgres_password_secret_id
-#   vpc_connector      = module.networking.vpc_connector_self_link
-#   depends_on         = [module.cloud_sql]
+#   source              = "./modules/temporal_server"
+#   project_id          = var.project_id
+#   region              = var.region
+#   app_name            = var.app_name
+#   environment         = var.environment
+#   image               = var.temporal_server_image
+#   temporal_namespace  = var.temporal_namespace
+#   cloud_sql_instance  = module.cloud_sql.instance_connection_name
+#   db_private_ip       = module.cloud_sql.private_ip_address
+#   db_password_secret  = module.secret_manager.temporal_postgres_password_secret_id
+#   vpc_connector       = module.networking.connector_self_link
+#   service_account     = module.iam.service_account_emails["worker"] # placeholder until temporal-server SA exists
 # }
-#
-# ...etc.
