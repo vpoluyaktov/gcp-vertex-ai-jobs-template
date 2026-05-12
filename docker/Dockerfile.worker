@@ -25,6 +25,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tini \
     && rm -rf /var/lib/apt/lists/*
 
+# Prefer IPv4 in glibc's getaddrinfo. Cloud Run Jobs run on IPv4-only VPC
+# subnets (stackType=IPV4_ONLY), but Google services like *.run.app advertise
+# both A and AAAA records. By default glibc sorts AAAA first (RFC 6724), so
+# the worker tries IPv6 and immediately hits "Network is unreachable" because
+# the IPv6 route doesn't exist in this VPC. The line below raises the
+# precedence of IPv4-mapped addresses (::ffff:0:0/96) above native IPv6.
+# See https://man7.org/linux/man-pages/man5/gai.conf.5.html.
+RUN printf 'precedence ::ffff:0:0/96 100\n' > /etc/gai.conf
+
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 

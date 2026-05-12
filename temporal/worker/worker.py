@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
 import sys
 
 from temporalio.client import Client, TLSConfig
@@ -77,6 +78,25 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _ipv4_address(address: str) -> tuple[str, str]:
+    """Resolve host in 'host:port' to its first IPv4 address.
+
+    VPC connectors are IPv4-only; the gRPC runtime tries IPv6 first when both
+    A and AAAA records exist, causing 'Network is unreachable' on Cloud Run Jobs
+    with all-traffic VPC egress. Forcing IPv4 here sidesteps that. The original
+    hostname is returned as the TLS SNI override so certificate validation still
+    works against the correct name.
+    """
+    host, _, port_str = address.rpartition(":")
+    port = int(port_str)
+    results = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    if not results:
+        raise RuntimeError(f"No IPv4 address found for {host!r}")
+    ipv4 = results[0][4][0]
+    logger.debug("Resolved %s -> %s (IPv4)", host, ipv4)
+    return f"{ipv4}:{port}", host
+
+
 async def _run_worker() -> None:
     logger.info(
         "Connecting to Temporal at %s (namespace=%s, queue=%s)",
@@ -85,13 +105,14 @@ async def _run_worker() -> None:
         _TEMPORAL_TASK_QUEUE,
     )
 
+    # Resolve to IPv4 explicitly — VPC connectors don't route IPv6 and gRPC
+    # picks IPv6 first when both A and AAAA records are returned.
+    connect_addr, sni_host = _ipv4_address(_TEMPORAL_ADDRESS)
+
     client = await Client.connect(
-        _TEMPORAL_ADDRESS,
+        connect_addr,
         namespace=_TEMPORAL_NAMESPACE,
-        # TLS without client cert — Cloud Run terminates mutual auth at the
-        # network layer; the worker only needs server-side TLS to protect the
-        # gRPC stream over the VPC connector.
-        tls=TLSConfig(),
+        tls=TLSConfig(server_name_override=sni_host),
     )
 
     worker = Worker(
