@@ -23,19 +23,34 @@ substitutions:
   _ENV: stage
   _DOCKERFILE: docker/Dockerfile.training.gpu
   _SBOM_BUCKET: ${PROJECT_ID}-build-artifacts
+  # Optional explicit tag. When empty, falls back to ${SHORT_SHA} + :latest.
+  # Set this from CI (e.g. release.yml uses the git tag) to encode versions.
+  _IMAGE_TAG: ""
+  # App name — currently informational, but kept as a substitution so future
+  # build steps that need it (e.g. labelling) don't require a YAML change.
+  _APP_NAME: gcp-vertex-ai-jobs-template
 
 steps:
   - id: build
     name: gcr.io/cloud-builders/docker
+    entrypoint: bash
     args:
-      - build
-      - --file=${_DOCKERFILE}
-      - --tag=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:${SHORT_SHA}
-      - --tag=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:latest
-      - --cache-from=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:latest
-      - --label=org.opencontainers.image.revision=${COMMIT_SHA}
-      - --label=org.opencontainers.image.source=https://github.com/${REPO_NAME}
-      - .
+      - -c
+      - |
+        set -euo pipefail
+        IMG="${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}"
+        EXTRA_TAG=""
+        if [ -n "${_IMAGE_TAG}" ]; then EXTRA_TAG="--tag=$$IMG:${_IMAGE_TAG}"; fi
+        docker build \
+          --file=${_DOCKERFILE} \
+          --tag=$$IMG:${SHORT_SHA} \
+          --tag=$$IMG:latest \
+          $$EXTRA_TAG \
+          --cache-from=$$IMG:latest \
+          --label=org.opencontainers.image.revision=${COMMIT_SHA} \
+          --label=org.opencontainers.image.source=https://github.com/${REPO_NAME} \
+          --label=app=${_APP_NAME} \
+          .
 
   - id: push
     name: gcr.io/cloud-builders/docker

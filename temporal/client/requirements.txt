@@ -1,1 +1,9 @@
-# TODO: pin temporal client dependencies (temporalio, pyyaml)
+# Dependencies for temporal/client/trigger_workflow.py.
+# Pinned to compatible ranges; the worker image's requirements file picks
+# its own versions inside the same major lines so the client and worker
+# stay protocol-compatible.
+
+temporalio>=1.7.0,<2
+pydantic>=2.0.0,<3
+PyYAML>=6.0,<7
+google-cloud-storage>=2.16.0,<3

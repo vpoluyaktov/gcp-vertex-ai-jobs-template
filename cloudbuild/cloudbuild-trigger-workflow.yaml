@@ -43,6 +43,8 @@ steps:
   # Build a thin job-submitter image on the fly. Keeping it inline (no
   # registry pull) means this YAML is self-contained and won't break if the
   # worker image isn't pushed yet (chicken-and-egg during first deploy).
+  # The image bundles temporal/ so trigger_workflow.py can import
+  # FineTuneRequest + FineTuneWorkflow.
   - id: build-submitter
     name: gcr.io/cloud-builders/docker
     entrypoint: bash
@@ -52,53 +54,28 @@ steps:
         set -euo pipefail
         cat > /workspace/Dockerfile.submit <<'EOF'
         FROM python:3.11-slim
-        RUN pip install --no-cache-dir \
-            temporalio>=1.7.0 \
-            google-cloud-storage>=2.16.0 \
-            PyYAML>=6.0
-        COPY temporal/ /app/temporal/
         WORKDIR /app
+        COPY temporal/client/requirements.txt /app/requirements.txt
+        RUN pip install --no-cache-dir -r /app/requirements.txt
+        COPY temporal/ /app/temporal/
         ENV PYTHONPATH=/app
+        ENTRYPOINT ["python", "-m", "temporal.client.trigger_workflow"]
         EOF
         docker build -f /workspace/Dockerfile.submit -t submitter:local .
 
-  # Submit a job via the worker's submit_job.py client (§12.6.3). The actual
-  # Temporal workflow runs on the worker Cloud Run Job — this step just sends
-  # the start signal and returns when Temporal has accepted the run.
+  # Run the trigger_workflow CLI. The submitter image's entrypoint is the
+  # CLI itself; CI just passes flags. The CLI prints the workflow_id + run_id
+  # as JSON to stdout on success.
   - id: submit-workflow
     name: submitter:local
-    entrypoint: bash
     env:
       - TEMPORAL_ADDRESS=${_TEMPORAL_ADDRESS}
       - TEMPORAL_NAMESPACE=${_TEMPORAL_NAMESPACE}
       - TEMPORAL_TASK_QUEUE=${_TEMPORAL_TASK_QUEUE}
-      - JOB_CONFIG_URI=${_JOB_CONFIG_URI}
-      - WORKFLOW_TIMEOUT_S=${_WORKFLOW_TIMEOUT_S}
     args:
-      - -c
-      - |
-        set -euo pipefail
-        echo "Submitting workflow against $$TEMPORAL_ADDRESS (namespace=$$TEMPORAL_NAMESPACE)"
-        if [ -f /app/temporal/submit_job.py ]; then
-          python /app/temporal/submit_job.py \
-            --job-config="$$JOB_CONFIG_URI" \
-            --wait-seconds=$$WORKFLOW_TIMEOUT_S
-        else
-          # Fallback when submit_job.py hasn't landed yet (early-deploy guard).
-          python - <<'PY'
-        import asyncio, os, sys, uuid
-        from temporalio.client import Client
-        async def main():
-            client = await Client.connect(
-                os.environ["TEMPORAL_ADDRESS"],
-                namespace=os.environ["TEMPORAL_NAMESPACE"],
-            )
-            wf_id = f"smoke-{uuid.uuid4().hex[:8]}"
-            print(f"Connected. Would submit workflow id={wf_id} task_queue={os.environ['TEMPORAL_TASK_QUEUE']}")
-            print("submit_job.py not yet present — connection-only smoke test passed.")
-        asyncio.run(main())
-        PY
-        fi
+      - --config=${_JOB_CONFIG_URI}
+      - --env=${_ENV}
+      - --wait-seconds=${_WORKFLOW_TIMEOUT_S}
 
 # Egress through the VPC connector so the build step can reach the Temporal
 # server's INTERNAL ingress address.

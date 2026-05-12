@@ -32,6 +32,7 @@ substitutions:
   _ADAPTER_URI: ""
   _TAG: ""
   _SBOM_BUCKET: ${PROJECT_ID}-build-artifacts
+  _APP_NAME: gcp-vertex-ai-jobs-template
 
 steps:
   - id: resolve-tag
@@ -68,6 +69,7 @@ steps:
           --label=org.opencontainers.image.source=https://github.com/${REPO_NAME} \
           --label=ai.adapter_uri=${_ADAPTER_URI} \
           --label=ai.base_model=${_BASE_MODEL_ID} \
+          --label=app=${_APP_NAME} \
           .
 
   - id: push
