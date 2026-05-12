@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, Optional
 
 from google.cloud import storage as _storage
 
-from data_prep.convert_documents import DocumentConverter, load_prelabelled_jsonl
+from data_prep.convert_documents import DocumentConverter, _sha256, load_prelabelled_jsonl
 from data_prep.validate_dataset import (
     DataValidationError,
     DatasetValidator,
@@ -65,7 +65,7 @@ def _write_progress(
         "stage": stage,
         "files_done": files_done,
         "files_total": files_total,
-        "started_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "started_at": datetime.datetime.now(datetime.UTC).isoformat(),
     })
     try:
         storage_client.bucket(bucket_name).blob(
@@ -73,6 +73,45 @@ def _write_progress(
         ).upload_from_string(payload.encode("utf-8"), content_type="application/json")
     except Exception as exc:
         logger.debug("Failed to write _progress.json: %s", exc)
+
+
+def _load_pipeline_cache(
+    storage_client: _storage.Client,
+    processed_uri: str,
+) -> dict[str, dict]:
+    """Load per-file idempotency cache from GCS.
+
+    Format: ``{blob_name: {"sha256": str, "rows": list[dict]}}``
+
+    Separate from ``convert_documents._load_processed_cache`` — this richer
+    format stores extracted rows so cached files still contribute to the
+    train/val split without re-extraction.
+    """
+    bucket_name, prefix = _parse_gcs_uri(processed_uri)
+    cache_blob = storage_client.bucket(bucket_name).blob(
+        f"{prefix}/.pipeline_cache.json"
+    )
+    if cache_blob.exists():
+        try:
+            return json.loads(cache_blob.download_as_text())
+        except Exception as exc:
+            logger.debug("Could not load pipeline cache (will rebuild): %s", exc)
+    return {}
+
+
+def _save_pipeline_cache(
+    storage_client: _storage.Client,
+    processed_uri: str,
+    cache: dict[str, dict],
+) -> None:
+    """Persist per-file idempotency cache to GCS."""
+    bucket_name, prefix = _parse_gcs_uri(processed_uri)
+    storage_client.bucket(bucket_name).blob(
+        f"{prefix}/.pipeline_cache.json"
+    ).upload_from_string(
+        json.dumps(cache, ensure_ascii=False).encode("utf-8"),
+        content_type="application/json",
+    )
 
 
 def run_pipeline(
@@ -152,35 +191,60 @@ def run_pipeline(
         strict=strict_extensions,
     )
 
+    # Load per-file SHA-256 idempotency cache so unchanged files skip re-extraction.
+    file_cache = _load_pipeline_cache(storage_client, processed_uri)
+
     rows: list[dict] = []
     files_done = 0
+    cache_hits = 0
 
     for blob in raw_blobs:
         ext = "." + blob.name.rsplit(".", 1)[-1].lower() if "." in blob.name else ""
 
         try:
-            # Pre-labelled JSONL → passthrough validation
-            if ext in (".jsonl", ".json"):
-                data = blob.download_as_bytes()
-                valid, rejected_pre = load_prelabelled_jsonl(data, data_format)
-                rows.extend(valid)
-                if rejected_pre:
-                    logger.warning(
-                        "%d pre-labelled rows rejected in '%s'",
-                        len(rejected_pre),
-                        blob.name,
-                    )
-            elif ext in _SUPPORTED_EXTENSIONS:
-                blob_rows = list(converter.convert_gcs_blob(blob))
-                rows.extend(blob_rows)
-            else:
-                if strict_extensions:
-                    raise DataValidationError(
-                        f"Unsupported extension {ext!r} for file {blob.name!r}"
-                    )
-                logger.warning(
-                    "Skipping unsupported extension %r (%s)", ext, blob.name
+            # Download bytes once — needed for SHA-256 regardless of cache state.
+            blob_bytes = blob.download_as_bytes()
+            file_sha = _sha256(blob_bytes)
+
+            cached = file_cache.get(blob.name)
+            if cached and cached.get("sha256") == file_sha:
+                # Cache hit: use previously extracted rows, no re-extraction.
+                logger.debug(
+                    "Cache hit: %s (%d rows)", blob.name, len(cached.get("rows", []))
                 )
+                rows.extend(cached.get("rows", []))
+                cache_hits += 1
+            else:
+                # Cache miss or file changed: extract rows and update cache.
+                blob_rows: list[dict] = []
+                if ext in (".jsonl", ".json"):
+                    valid, rejected_pre = load_prelabelled_jsonl(blob_bytes, data_format)
+                    blob_rows.extend(valid)
+                    if rejected_pre:
+                        logger.warning(
+                            "%d pre-labelled rows rejected in '%s'",
+                            len(rejected_pre),
+                            blob.name,
+                        )
+                elif ext in _SUPPORTED_EXTENSIONS:
+                    blob_rows = list(
+                        converter.convert_bytes(
+                            blob_bytes,
+                            blob.name.rsplit("/", 1)[-1],
+                            source_uri=f"gs://{bucket_name}/{blob.name}",
+                        )
+                    )
+                else:
+                    if strict_extensions:
+                        raise DataValidationError(
+                            f"Unsupported extension {ext!r} for file {blob.name!r}"
+                        )
+                    logger.warning(
+                        "Skipping unsupported extension %r (%s)", ext, blob.name
+                    )
+
+                rows.extend(blob_rows)
+                file_cache[blob.name] = {"sha256": file_sha, "rows": blob_rows}
 
         except DataValidationError:
             raise
@@ -196,6 +260,15 @@ def run_pipeline(
             )
             if heartbeat_fn:
                 heartbeat_fn(files_done)
+
+    # Persist updated cache (best-effort — don't let cache write fail the pipeline).
+    try:
+        _save_pipeline_cache(storage_client, processed_uri, file_cache)
+    except Exception as exc:
+        logger.warning("Failed to save pipeline cache: %s", exc)
+
+    if cache_hits:
+        logger.info("Loaded %d/%d files from cache (SHA-256 match)", cache_hits, files_total)
 
     logger.info("Extracted %d rows from %d files", len(rows), files_total)
 

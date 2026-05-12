@@ -1,1 +1,71 @@
-# TODO: training job config for Llama-3-70B (QLoRA, multi-A100/H100, deepspeed zero3)
+# Fine-tune campaign: Llama 3.1 70B Instruct with QLoRA on 8× A100 80 GB.
+# QLoRA (4-bit base, LoRA adapters) keeps GPU memory within 8× A100 80 GB.
+# Multi-GPU training via FSDP sharding — Unsloth handles FSDP setup automatically.
+# See §14.1 and §14.1.c of ARCHITECTURE.md.
+
+job_name: llama3-70b-qlora-v1
+
+model:
+  base_model_id: unsloth/Meta-Llama-3.1-70B-Instruct  # ungated, no HF_TOKEN needed
+  revision: main
+
+peft:
+  type: qlora          # QLoRA: 4-bit quantised base + LoRA adapters
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  bias: none
+  merge_after_training: false
+
+data:
+  raw_uri: gs://BUCKET-raw-documents/llama3-70b-qlora-v1/
+  processed_uri: null
+  format: chat
+  train_split: 0.95
+  validation_split: 0.05
+
+training:
+  epochs: 2                          # 70B converges faster; 1–2 epochs typical
+  per_device_batch_size: 1           # 70B in 4-bit fills ~50 GB/GPU at seq_len=2048
+  gradient_accumulation_steps: 16    # effective batch ≈ 128 (8 GPUs × 1 × 16)
+  learning_rate: 1.0e-4              # lower lr for larger model
+  warmup_ratio: 0.03
+  max_seq_length: 2048               # keep lower than 8B to fit 8× A100 80 GB
+  bf16: true
+  gradient_checkpointing: true       # required at 70B — trades compute for memory
+
+infrastructure:
+  use_gpu: true
+  machine_type: a2-ultragpu-8g       # 8× A100 80 GB (640 GB aggregate VRAM)
+  accelerator_type: NVIDIA_TESLA_A100
+  accelerator_count: 8
+  spot: true
+  fallback_on_demand: true
+  max_preemptions: 2                 # allow up to 2 checkpoint-resume retries
+  region: us-central1
+
+artifacts:
+  output_uri: gs://BUCKET-final-models/llama3-70b-qlora-v1/
+  checkpoint_uri: gs://BUCKET-checkpoints/llama3-70b-qlora-v1/
+  upload_hf_hub: false
+  hf_repo_id: null
+  hf_private: true
+  register_in_vertex: true
+  prepare_serving_image: true        # build vLLM serving image after training
+
+evaluation:
+  min_eval_score: 0.65
+  retry_on_low_score: true
+  retry_lr_multiplier: 0.5
+
+notifications:
+  slack_webhook_secret: null    # e.g. projects/PROJECT/secrets/slack-webhook/versions/latest
+  email_to: null
