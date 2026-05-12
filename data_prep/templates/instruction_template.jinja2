@@ -1,9 +1,26 @@
-{# TODO: instruction tuning template — Jinja2 #}
-{# Example:
-<|system|>
-{{ system_prompt }}
-<|user|>
-{{ instruction }}
-<|assistant|>
-{{ response }}
+{#
+  instruction_template.jinja2
+  ===========================
+  Renders one JSONL training row from a document chunk.
+
+  Required variables
+  ------------------
+  format          : "chat" | "instruct"
+  system_prompt   : string — loaded from templates/system_prompt.txt
+  extraction_task : string — domain-specific instruction (see DOMAIN_TASKS in convert_documents.py)
+  document_text   : string — the extracted + chunked document content
+  source_name     : string — original filename, used for context in the user turn
+  expected_output : string — labelled answer; empty string for unlabelled chunks
+
+  Output
+  ------
+  A single line of JSON (no trailing newline) suitable for direct JSONL append.
+  The caller parses this with json.loads() to get a Python dict.
 #}
+{%- set user_content = extraction_task ~ "\n\n---\nSource: " ~ source_name ~ "\n\n" ~ document_text -%}
+{%- set assistant_content = expected_output if expected_output else "[No labelled output — generate the extraction from the document above.]" -%}
+{%- if format == "chat" -%}
+{{ {"messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}, {"role": "assistant", "content": assistant_content}]} | tojson }}
+{%- else -%}
+{{ {"instruction": extraction_task, "input": document_text, "output": expected_output} | tojson }}
+{%- endif -%}

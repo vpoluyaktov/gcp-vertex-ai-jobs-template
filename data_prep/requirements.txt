@@ -6,3 +6,5 @@ lxml>=5.0.0,<6
 google-cloud-storage>=2.16.0,<3
 pydantic>=2.0.0,<3
 Jinja2>=3.1.0,<4
+tqdm>=4.66.0,<5
+jsonlines>=4.0.0,<5
