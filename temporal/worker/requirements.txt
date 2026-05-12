@@ -1,0 +1,1 @@
+# TODO: pin temporal worker dependencies (temporalio, google-cloud-aiplatform, google-cloud-storage, etc.)

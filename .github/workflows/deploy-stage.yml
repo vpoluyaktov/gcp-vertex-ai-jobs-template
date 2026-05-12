@@ -1,0 +1,11 @@
+# TODO: staging deployment — Terraform apply against dfh-stage-id, build images, deploy temporal worker
+name: deploy-stage
+on:
+  push:
+    branches: [stage]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # TODO: auth to dfh-stage-id, terraform apply, build/push images, deploy worker

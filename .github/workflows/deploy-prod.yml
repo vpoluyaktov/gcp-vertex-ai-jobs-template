@@ -1,0 +1,11 @@
+# TODO: production deployment — Terraform apply against dfh-prod-id, build images, deploy temporal worker
+name: deploy-prod
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # TODO: auth to dfh-prod-id, terraform apply, build/push images, deploy worker

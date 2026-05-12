@@ -1,0 +1,12 @@
+# TODO: CI workflow — lint (ruff/flake8) and test (pytest) on push/PR
+name: ci
+on:
+  push:
+    branches: [main, stage]
+  pull_request:
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # TODO: setup-python, install deps, run lint + tests

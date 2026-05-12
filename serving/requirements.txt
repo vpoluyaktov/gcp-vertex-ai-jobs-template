@@ -1,0 +1,1 @@
+# TODO: pin serving dependencies (vllm or text-generation-inference client, fastapi, uvicorn)

@@ -1,0 +1,1 @@
+# TODO: pin temporal client dependencies (temporalio, pyyaml)

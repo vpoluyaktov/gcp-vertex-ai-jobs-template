@@ -1,0 +1,3 @@
+project_id = "dfh-stage-id"
+region     = "us-central1"
+app_name   = "vertex-ai-jobs-template"
