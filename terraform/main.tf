@@ -213,5 +213,26 @@ module "vertex_ai" {
 }
 
 # -----------------------------------------------------------------------------
+# Cloud Build Private Worker Pool — workers peered into the VPC so they can
+# reach INTERNAL-ingress services (temporal-server, Cloud SQL private IP).
+# Without this, cloudbuild-trigger-workflow.yaml can't reach the Temporal
+# server's :443 endpoint from within a build.
+# -----------------------------------------------------------------------------
+
+module "cloud_build" {
+  source = "./modules/cloud_build"
+
+  project_id        = var.project_id
+  region            = var.region
+  app_name          = var.app_name
+  environment       = var.environment
+  network_self_link = module.networking.network_self_link
+  psa_dependency    = module.networking.private_service_connection
+  labels            = local.common_labels
+
+  depends_on = [google_project_service.apis]
+}
+
+# -----------------------------------------------------------------------------
 # TODO (next tasks): remaining modules per ARCHITECTURE.md §12.1:
-#   cloud_run_worker → cloud_build → scheduler → monitoring
+#   cloud_run_worker → scheduler → monitoring

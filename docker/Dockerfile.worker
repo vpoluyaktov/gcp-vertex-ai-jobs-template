@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1.7
+###############################################################################
+# Temporal worker container.
+#
+# Runs as a Cloud Run Job (long-running on a 1h schedule, or invoked
+# on-demand) that polls the Temporal frontend for FineTuneWorkflow tasks
+# and executes activities (data prep, build trigger, training submit, …).
+#
+# Image is consumed by the temporal-worker Cloud Run Job — see
+# ARCHITECTURE.md §12.6.3 and §9.1 `worker-image-<env>` trigger.
+###############################################################################
+
+FROM python:3.11-slim-bookworm AS runtime
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# - ca-certificates: for HTTPS to GCS / Cloud Build / Vertex
+# - curl + git: handy for runtime debugging of stuck workflows
+# - tini: PID-1 reaper so SIGTERM from Cloud Run Job cancellation actually
+#   kills the worker cleanly instead of leaving zombies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install worker deps. temporal/worker/requirements.txt is the worker's own
+# pin set (temporalio + activity deps); kept separate from training/ deps
+# so the worker image stays slim.
+COPY temporal/worker/requirements.txt /tmp/worker-requirements.txt
+RUN pip install --upgrade pip wheel setuptools \
+    && pip install -r /tmp/worker-requirements.txt \
+    && rm /tmp/worker-requirements.txt
+
+# Non-root user — Cloud Run Job permits arbitrary uids; 1000 matches the
+# training image so volume mounts (gcsfuse, scratch dirs) behave identically.
+ARG WORKER_UID=1000
+RUN groupadd --system --gid ${WORKER_UID} worker \
+    && useradd --system --uid ${WORKER_UID} --gid worker --create-home --shell /bin/bash worker
+
+# Copy the whole temporal/ tree so worker.py can import workflows.* and
+# activities.* siblings.
+WORKDIR /app
+COPY --chown=worker:worker temporal/ /app/temporal/
+
+USER worker
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    # Defaults the worker picks up at startup; deploy-stage.yml / deploy-prod.yml
+    # override these via Cloud Run Job env vars at apply time.
+    TEMPORAL_NAMESPACE=default \
+    TEMPORAL_TASK_QUEUE=vertex-finetune-stage
+
+WORKDIR /app/temporal/worker
+
+# `python worker.py` per the team-lead brief — PYTHONPATH=/app makes
+# `from temporal.workflows.* import …` resolve correctly even from this CWD.
+ENTRYPOINT ["/usr/bin/tini", "--", "python", "worker.py"]

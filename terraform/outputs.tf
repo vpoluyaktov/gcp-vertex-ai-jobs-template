@@ -135,3 +135,12 @@ output "metadata_store_name" {
   description = "ML Metadata store resource name (empty when not created — default store is used)"
   value       = module.vertex_ai.metadata_store_name
 }
+
+# -----------------------------------------------------------------------------
+# Cloud Build Private Worker Pool
+# -----------------------------------------------------------------------------
+
+output "cloud_build_worker_pool_id" {
+  description = "Full Cloud Build worker pool resource id — consumed by cloudbuild YAMLs via options.pool.name to run builds inside the VPC"
+  value       = module.cloud_build.worker_pool_id
+}

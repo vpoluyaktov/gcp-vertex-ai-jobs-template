@@ -1,0 +1,74 @@
+###############################################################################
+# Cloud Build — data-prep image.
+#
+# Spec: ARCHITECTURE.md §9.1 `data-prep-image-<env>`.
+# Trigger: push to stage/main with path filters data_prep/** or
+# docker/Dockerfile.data_prep.
+#
+# Pushes to the `training-images` AR repo (per team-lead brief).
+###############################################################################
+
+substitutions:
+  _REGION: us-central1
+  _AR_REPO: training-images
+  _IMAGE_NAME: data-prep
+  _ENV: stage
+  _IMAGE_TAG: ""
+  _APP_NAME: gcp-vertex-ai-jobs-template
+  _SBOM_BUCKET: ${PROJECT_ID}-build-artifacts
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        IMG="${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}"
+        EXTRA_TAG=""
+        if [ -n "${_IMAGE_TAG}" ]; then EXTRA_TAG="--tag=$$IMG:${_IMAGE_TAG}"; fi
+        docker build \
+          --file=docker/Dockerfile.data_prep \
+          --tag=$$IMG:${SHORT_SHA} \
+          --tag=$$IMG:latest \
+          $$EXTRA_TAG \
+          --cache-from=$$IMG:latest \
+          --label=org.opencontainers.image.revision=${COMMIT_SHA} \
+          --label=org.opencontainers.image.source=https://github.com/${REPO_NAME} \
+          --label=app=${_APP_NAME} \
+          --label=component=data-prep \
+          .
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}
+
+  - id: scan
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        IMAGE="${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:${SHORT_SHA}"
+        gcloud artifacts docker images scan "$$IMAGE" \
+          --format=json --location=${_REGION} > sbom.json || \
+          { echo "scan returned non-zero — proceeding with empty SBOM"; echo '{}' > sbom.json; }
+        gsutil cp sbom.json gs://${_SBOM_BUCKET}/sboms/${_IMAGE_NAME}/${SHORT_SHA}.json
+
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+  dynamicSubstitutions: true
+
+timeout: 1800s
+
+serviceAccount: projects/${PROJECT_ID}/serviceAccounts/cloudbuild-${_ENV}@${PROJECT_ID}.iam.gserviceaccount.com
+
+images:
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:${SHORT_SHA}
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}:latest

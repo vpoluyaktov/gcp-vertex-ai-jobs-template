@@ -38,6 +38,12 @@ substitutions:
   _TEMPORAL_TASK_QUEUE: vertex-finetune-${_ENV}
   _JOB_CONFIG_URI: gs://${PROJECT_ID}-configs/debug.yaml
   _WORKFLOW_TIMEOUT_S: "300"
+  # Full resource id of the Cloud Build Private Worker Pool (output of
+  # terraform/modules/cloud_build). Required — leaving this blank causes
+  # Cloud Build to use the default pool, which CANNOT reach the INTERNAL
+  # Temporal server.
+  _WORKER_POOL: projects/${PROJECT_ID}/locations/${_REGION}/workerPools/${_APP_NAME}-${_ENV}
+  _APP_NAME: gcp-vertex-ai-jobs-template
 
 steps:
   # Build a thin job-submitter image on the fly. Keeping it inline (no
@@ -77,19 +83,17 @@ steps:
       - --env=${_ENV}
       - --wait-seconds=${_WORKFLOW_TIMEOUT_S}
 
-# Egress through the VPC connector so the build step can reach the Temporal
-# server's INTERNAL ingress address.
+# Runs on the Private Worker Pool provisioned by terraform/modules/cloud_build,
+# which is peered into the env's VPC so workers can reach the INTERNAL-ingress
+# Temporal server and Cloud SQL private IP. The pool resource id is reported
+# by Terraform as `cloud_build_worker_pool_id` — that's what _WORKER_POOL
+# should be set to from CI (deploy-stage.yml / deploy-prod.yml pass it
+# verbatim via `--substitutions=_WORKER_POOL=...`).
 options:
-  machineType: E2_STANDARD_2
   logging: CLOUD_LOGGING_ONLY
   dynamicSubstitutions: true
   pool:
-    name: ""
-  # NOTE: Standard Cloud Build workers don't sit in a customer VPC by default.
-  # When the team-lead promotes this to a real Private Pool, replace
-  # `pool.name` above with the worker pool resource name (e.g.
-  # projects/<proj>/locations/us-central1/workerPools/cloudbuild-<env>) and
-  # remove this NOTE.
+    name: ${_WORKER_POOL}
 
 timeout: 600s
 

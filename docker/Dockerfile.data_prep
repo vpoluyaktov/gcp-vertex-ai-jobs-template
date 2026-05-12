@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1.7
+###############################################################################
+# Data preparation container.
+#
+# Per ARCHITECTURE.md §5 and §9.1 `data-prep-image-<env>` trigger. Image is
+# invoked from within `temporal.activities.data_prep_activity` (Step 1 of the
+# fine-tune workflow). It walks the customer's raw-documents bucket, extracts
+# text, chunks/synthesises, and writes JSONL splits to processed-datasets.
+#
+# Not a long-running service — runs once per workflow invocation as a
+# Cloud Run Job (or shells out as a Vertex AI CustomJob, depending on
+# input volume).
+###############################################################################
+
+FROM python:3.11-slim-bookworm AS runtime
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# - libmagic1: file-type detection (data_prep/extractors/*.py needs it)
+# - poppler-utils: PDF text extraction fallback (pdfplumber uses pdftotext)
+# - tesseract-ocr: OCR fallback for scanned PDFs
+# - ca-certificates: HTTPS to GCS, HF Hub
+# - git: optional, for pulling pinned-by-commit prompt templates
+# - tini: PID-1 reaper for clean Cloud Run Job cancellation
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libmagic1 \
+        poppler-utils \
+        tesseract-ocr \
+        git \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+COPY data_prep/requirements.txt /tmp/data-prep-requirements.txt
+RUN pip install --upgrade pip wheel setuptools \
+    && pip install -r /tmp/data-prep-requirements.txt \
+    && rm /tmp/data-prep-requirements.txt
+
+# Non-root user — uid 1000 keeps gcsfuse mounts compatible with the worker
+# and training images.
+ARG DATAPREP_UID=1000
+RUN groupadd --system --gid ${DATAPREP_UID} dataprep \
+    && useradd --system --uid ${DATAPREP_UID} --gid dataprep --create-home --shell /bin/bash dataprep
+
+WORKDIR /app
+COPY --chown=dataprep:dataprep data_prep/ /app/data_prep/
+
+USER dataprep
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
+
+WORKDIR /app/data_prep
+
+# `python pipeline.py` per the team-lead brief. PYTHONPATH=/app makes
+# `from data_prep.extractors import …` resolve correctly even from this CWD.
+# pipeline.py exposes a CLI entrypoint that argparses --raw-uri/--processed-uri
+# arguments for standalone runs.
+ENTRYPOINT ["/usr/bin/tini", "--", "python", "pipeline.py"]
