@@ -38,12 +38,14 @@ ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # Install worker deps. temporal/worker/requirements.txt is the worker's own
-# pin set (temporalio + activity deps); kept separate from training/ deps
-# so the worker image stays slim.
+# pin set (temporalio + activity deps). data_prep/requirements.txt is also
+# needed because the validate_and_preprocess activity calls data_prep.pipeline.
 COPY temporal/worker/requirements.txt /tmp/worker-requirements.txt
+COPY data_prep/requirements.txt /tmp/data-prep-requirements.txt
 RUN pip install --upgrade pip wheel setuptools \
     && pip install -r /tmp/worker-requirements.txt \
-    && rm /tmp/worker-requirements.txt
+    && pip install -r /tmp/data-prep-requirements.txt \
+    && rm /tmp/worker-requirements.txt /tmp/data-prep-requirements.txt
 
 # Non-root user — Cloud Run Job permits arbitrary uids; 1000 matches the
 # training image so volume mounts (gcsfuse, scratch dirs) behave identically.
@@ -52,9 +54,11 @@ RUN groupadd --system --gid ${WORKER_UID} worker \
     && useradd --system --uid ${WORKER_UID} --gid worker --create-home --shell /bin/bash worker
 
 # Copy the whole temporal/ tree so worker.py can import workflows.* and
-# activities.* siblings.
+# activities.* siblings. data_prep/ is also needed — the data_prep activity
+# calls data_prep.pipeline.run_pipeline() at runtime.
 WORKDIR /app
 COPY --chown=worker:worker temporal/ /app/temporal/
+COPY --chown=worker:worker data_prep/ /app/data_prep/
 
 USER worker
 
