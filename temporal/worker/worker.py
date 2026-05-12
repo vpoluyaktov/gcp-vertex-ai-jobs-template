@@ -112,7 +112,7 @@ async def _run_worker() -> None:
     client = await Client.connect(
         connect_addr,
         namespace=_TEMPORAL_NAMESPACE,
-        tls=TLSConfig(server_name_override=sni_host),
+        tls=TLSConfig(domain=sni_host),
     )
 
     worker = Worker(
