@@ -38,22 +38,47 @@ resource "terraform_data" "scaffold_sentinel" {
 }
 
 # TODO(devops): wire modules per ARCHITECTURE.md §12.1 once module variables
-# are defined. Suggested order: gcs → iam → artifact_registry → secret_manager
-# → vertex_ai → cloud_run_worker → cloud_build → scheduler → networking
-# → monitoring.
+# are defined. Mandatory apply order (enforced by depends_on per §12.1):
+#   networking → cloud_sql → temporal_server → cloud_run_worker
+# Full sequence:
+#   networking → gcs → iam → artifact_registry → secret_manager
+#   → cloud_sql → temporal_server → vertex_ai → cloud_run_worker
+#   → cloud_build → scheduler → monitoring
 #
-# module "gcs_buckets" {
-#   source      = "./modules/gcs"
-#   project_id  = var.project_id
-#   app_name    = var.app_name
-#   environment = var.environment
+# module "networking" {
+#   source             = "./modules/networking"
+#   project_id         = var.project_id
+#   app_name           = var.app_name
+#   environment        = var.environment
+#   region             = var.region
+#   vpc_cidr           = var.vpc_cidr
+#   vpc_connector_cidr = var.vpc_connector_cidr
 # }
 #
-# module "iam" {
-#   source      = "./modules/iam"
-#   project_id  = var.project_id
-#   app_name    = var.app_name
-#   environment = var.environment
+# module "cloud_sql" {
+#   source            = "./modules/cloud_sql"
+#   project_id        = var.project_id
+#   app_name          = var.app_name
+#   environment       = var.environment
+#   region            = var.region
+#   tier              = var.cloud_sql_tier
+#   disk_gb           = var.cloud_sql_disk_gb
+#   private_network   = module.networking.vpc_self_link
+#   depends_on        = [module.networking]
+# }
+#
+# module "temporal_server" {
+#   source             = "./modules/temporal_server"
+#   project_id         = var.project_id
+#   app_name           = var.app_name
+#   environment        = var.environment
+#   region             = var.region
+#   image              = var.temporal_server_image
+#   temporal_namespace = var.temporal_namespace
+#   cloud_sql_instance = module.cloud_sql.instance_connection_name
+#   db_password_secret = module.secret_manager.temporal_postgres_password_secret_id
+#   vpc_connector      = module.networking.vpc_connector_self_link
+#   depends_on         = [module.cloud_sql]
 # }
 #
 # ...etc.

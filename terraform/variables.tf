@@ -39,23 +39,51 @@ variable "custom_domain" {
   type        = string
 }
 
-variable "temporal_cloud" {
-  description = "If true, use Temporal Cloud and skip the self-hosted module"
-  type        = bool
-  default     = false
-}
+# -----------------------------------------------------------------------------
+# Self-hosted Temporal on Cloud Run + Cloud SQL (ARCHITECTURE.md §12.6).
+# The previous Temporal Cloud path (var.temporal_cloud) was rejected in design
+# review and has been removed.
+# -----------------------------------------------------------------------------
 
 variable "temporal_namespace" {
-  description = "Temporal Cloud namespace (required only when temporal_cloud=true)"
+  description = "Temporal namespace name (recommended value: \"default\")"
   type        = string
-  default     = ""
 }
 
-variable "vpc_enabled" {
-  description = "If true, create VPC + private service access for private Vertex AI endpoints"
-  type        = bool
-  default     = false
+variable "temporal_server_image" {
+  description = "Container image for the self-hosted Temporal server. Architect publishes a digest-pinned reference of temporalio/auto-setup:1.25; per-env override allowed."
+  type        = string
 }
+
+variable "cloud_sql_tier" {
+  description = "Cloud SQL instance tier backing Temporal persistence (recommended: db-custom-2-7680 — 2 vCPU, 7.5 GiB)"
+  type        = string
+}
+
+variable "cloud_sql_disk_gb" {
+  description = "Postgres disk size in GB (recommended: 20)"
+  type        = number
+}
+
+# -----------------------------------------------------------------------------
+# Networking (REQUIRED — no longer optional). VPC + subnet + Serverless VPC
+# Access Connector + Private Service Access are mandatory so the Cloud Run
+# worker and temporal-server can reach Cloud SQL over a private IP.
+# -----------------------------------------------------------------------------
+
+variable "vpc_cidr" {
+  description = "CIDR for the env subnet (e.g. 10.20.0.0/24 stage, 10.30.0.0/24 prod)"
+  type        = string
+}
+
+variable "vpc_connector_cidr" {
+  description = "/28 CIDR reserved for the Serverless VPC Access Connector (e.g. 10.20.1.0/28 stage, 10.30.1.0/28 prod)"
+  type        = string
+}
+
+# -----------------------------------------------------------------------------
+# Feature flags (optional).
+# -----------------------------------------------------------------------------
 
 variable "enable_w_and_b" {
   description = "If true, provision the wandb-api-key secret in Secret Manager"
