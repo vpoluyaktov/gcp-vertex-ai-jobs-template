@@ -17,8 +17,8 @@ import os
 import time
 from typing import Optional
 
-from google.cloud import devtools_cloudbuild_v1 as cloudbuild
-from google.cloud.devtools_cloudbuild_v1 import Build
+from google.cloud.devtools import cloudbuild_v1 as cloudbuild
+from google.cloud.devtools.cloudbuild_v1 import Build
 from temporalio import activity
 
 from temporal.workflows.shared import BuildFailed, BuildResult, ServingResult
