@@ -78,3 +78,37 @@ output "serving_images_repo_url" {
   description = "Push/pull URL for serving images"
   value       = module.artifact_registry.serving_images_repo_url
 }
+
+# -----------------------------------------------------------------------------
+# Cloud SQL (Temporal persistence)
+# -----------------------------------------------------------------------------
+
+output "temporal_db_instance_name" {
+  description = "Cloud SQL instance hosting the Temporal databases"
+  value       = module.cloud_sql.instance_name
+}
+
+output "temporal_db_private_ip" {
+  description = "Private IP of the Cloud SQL instance (sensitive — only reachable from inside the VPC)"
+  value       = module.cloud_sql.private_ip_address
+  sensitive   = true
+}
+
+output "temporal_db_password_secret" {
+  description = "Secret Manager resource id for the Postgres password"
+  value       = module.cloud_sql.password_secret_id
+}
+
+# -----------------------------------------------------------------------------
+# Temporal server (Cloud Run)
+# -----------------------------------------------------------------------------
+
+output "temporal_server_uri" {
+  description = "Cloud Run-issued URI for the Temporal server (INTERNAL ingress)"
+  value       = module.temporal_server.service_uri
+}
+
+output "temporal_server_internal_hostname" {
+  description = "Stable VPC-internal hostname (temporal-server.<env>.internal)"
+  value       = module.temporal_server.internal_hostname
+}

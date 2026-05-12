@@ -109,47 +109,62 @@ module "artifact_registry" {
 }
 
 # -----------------------------------------------------------------------------
-# TODO (next tasks): wire the remaining modules.
-# Mandatory apply order (enforced by depends_on per §12.1):
-#   networking → cloud_sql → temporal_server → cloud_run_worker
-# Full sequence:
-#   networking → gcs → iam → artifact_registry → secret_manager
-#   → cloud_sql → temporal_server → vertex_ai → cloud_run_worker
-#   → cloud_build → scheduler → monitoring
-#
-# module "secret_manager" {
-#   source                  = "./modules/secret_manager"
-#   project_id              = var.project_id
-#   app_name                = var.app_name
-#   environment             = var.environment
-#   enable_w_and_b          = var.enable_w_and_b
-#   temporal_server_sa_email = module.iam.service_account_emails["worker"] # placeholder
-# }
-#
-# module "cloud_sql" {
-#   source             = "./modules/cloud_sql"
-#   project_id         = var.project_id
-#   region             = var.region
-#   app_name           = var.app_name
-#   environment        = var.environment
-#   tier               = var.cloud_sql_tier
-#   disk_gb            = var.cloud_sql_disk_gb
-#   network_self_link  = module.networking.network_self_link
-#   psa_dependency     = module.networking.private_service_connection
-#   db_password_secret = module.secret_manager.temporal_postgres_password_secret_id
-# }
-#
-# module "temporal_server" {
-#   source              = "./modules/temporal_server"
-#   project_id          = var.project_id
-#   region              = var.region
-#   app_name            = var.app_name
-#   environment         = var.environment
-#   image               = var.temporal_server_image
-#   temporal_namespace  = var.temporal_namespace
-#   cloud_sql_instance  = module.cloud_sql.instance_connection_name
-#   db_private_ip       = module.cloud_sql.private_ip_address
-#   db_password_secret  = module.secret_manager.temporal_postgres_password_secret_id
-#   vpc_connector       = module.networking.connector_self_link
-#   service_account     = module.iam.service_account_emails["worker"] # placeholder until temporal-server SA exists
-# }
+# Cloud SQL — Postgres backing the Temporal server. Depends on networking via
+# psa_dependency so the PSA peering exists before the private-IP instance is
+# created.
+# -----------------------------------------------------------------------------
+
+module "cloud_sql" {
+  source = "./modules/cloud_sql"
+
+  project_id          = var.project_id
+  region              = var.region
+  app_name            = var.app_name
+  environment         = var.environment
+  tier                = var.cloud_sql_tier
+  disk_gb             = var.cloud_sql_disk_gb
+  network_id          = module.networking.network_id
+  psa_dependency      = module.networking.private_service_connection
+  deletion_protection = var.environment == "prod"
+  labels              = local.common_labels
+
+  depends_on = [google_project_service.apis]
+}
+
+# -----------------------------------------------------------------------------
+# Temporal server — Cloud Run Service running auto-setup. Depends on cloud_sql
+# (private IP + password secret) and on iam (the temporal-server SA).
+# -----------------------------------------------------------------------------
+
+module "temporal_server" {
+  source = "./modules/temporal_server"
+
+  project_id            = var.project_id
+  region                = var.region
+  app_name              = var.app_name
+  environment           = var.environment
+  image                 = var.temporal_server_image
+  temporal_namespace    = var.temporal_namespace
+  service_account_email = module.iam.temporal_server_sa_email
+
+  vpc_connector_id  = module.networking.connector_self_link
+  network_self_link = module.networking.network_self_link
+
+  cloud_sql_private_ip               = module.cloud_sql.private_ip_address
+  cloud_sql_instance_connection_name = module.cloud_sql.instance_connection_name
+  db_user                            = module.cloud_sql.database_user
+  db_name                            = module.cloud_sql.temporal_database_name
+  db_visibility_name                 = module.cloud_sql.temporal_visibility_database_name
+  db_password_secret_id              = module.cloud_sql.password_secret_id
+  db_password_secret_name            = module.cloud_sql.password_secret_name
+  db_password_secret_version         = module.cloud_sql.password_secret_version
+
+  labels = local.common_labels
+
+  depends_on = [module.cloud_sql]
+}
+
+# -----------------------------------------------------------------------------
+# TODO (next tasks): remaining modules per ARCHITECTURE.md §12.1:
+#   secret_manager → vertex_ai → cloud_run_worker → cloud_build → scheduler
+#   → monitoring

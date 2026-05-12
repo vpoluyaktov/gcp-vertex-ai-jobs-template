@@ -38,6 +38,11 @@ output "scheduler_sa_email" {
   value       = google_service_account.sa["scheduler"].email
 }
 
+output "temporal_server_sa_email" {
+  description = "Temporal server SA — Cloud Run Service identity for temporalio/auto-setup (§12.6.4)"
+  value       = google_service_account.sa["temporal-server"].email
+}
+
 output "workload_identity_pool_name" {
   description = "Full WIF pool resource name (empty string when WIF is disabled)"
   value       = var.enable_workload_identity_federation ? google_iam_workload_identity_pool.github[0].name : ""

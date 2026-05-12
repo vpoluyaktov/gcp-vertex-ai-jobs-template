@@ -43,6 +43,14 @@ locals {
       account_id   = "scheduler-${local.env}"
       display_name = "Cloud Scheduler SA (${title(local.env)})"
     }
+    # §12.6.4 addition for the self-hosted Temporal server Cloud Run service.
+    # Scoped secretAccessor on temporal-postgres-password is granted *inside*
+    # the temporal_server module (it depends on the cloud_sql module's secret),
+    # so only the non-secret project-level roles live here.
+    temporal-server = {
+      account_id   = "temporal-server-${local.env}"
+      display_name = "Temporal server SA (${title(local.env)})"
+    }
   }
 
   # Project-level roles per §7. NO storage.objectAdmin at project level (§7.2).
@@ -97,6 +105,14 @@ locals {
       "roles/run.invoker",
       "roles/aiplatform.user",
     ] : { sa = "scheduler", role = r }],
+
+    # temporal-server — Cloud Run Service identity for the Temporal server.
+    # §12.6.4: cloudsql.client (talks to the Cloud SQL private IP) + logging.
+    # secretAccessor is granted per-secret in the temporal_server module.
+    [for r in [
+      "roles/cloudsql.client",
+      "roles/logging.logWriter",
+    ] : { sa = "temporal-server", role = r }],
   ])
 
   # Scoped bucket bindings (§7.2) — every entry becomes a single
