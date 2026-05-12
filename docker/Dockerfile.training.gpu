@@ -15,9 +15,16 @@
 #   - HEALTHCHECK: none (Vertex AI does its own job-level health checks)
 ###############################################################################
 
-# TODO(architect): replace tag with digest pin —
-# nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04@sha256:<sha>
-ARG CUDA_BASE=nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+# Digest-pinned for reproducibility (ARCHITECTURE.md §10.1). The digest is
+# the linux/amd64 variant of nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 — the
+# only architecture Vertex AI GPU machines run.
+#
+# To refresh after an upstream image rebuild:
+#   docker manifest inspect nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 --verbose \
+#     | python3 -c "import sys, json; d=json.load(sys.stdin); \
+#         print([m['Descriptor']['digest'] for m in d \
+#                if m['Descriptor']['platform']['architecture']=='amd64'][0])"
+ARG CUDA_BASE=nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04@sha256:0a1cb6e7bd047a1067efe14efdf0276352d5ca643dfd77963dab1a4f05a003a4
 
 # ------------------------------------------------------------ stage 1: builder
 FROM ${CUDA_BASE} AS builder
