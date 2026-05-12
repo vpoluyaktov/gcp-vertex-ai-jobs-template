@@ -1,1 +1,5 @@
-# TODO: pin serving dependencies (vllm or text-generation-inference client, fastapi, uvicorn)
+# Extra Python dependencies installed on top of the vllm/vllm-openai base image.
+# vllm itself is pre-installed in vllm/vllm-openai:v0.6.3 — do NOT pin it here.
+google-cloud-storage>=2.16,<3
+huggingface-hub>=0.25,<1
+pydantic>=2,<3
