@@ -2,15 +2,16 @@
 
 Reads connection parameters from environment variables:
   TEMPORAL_ADDRESS      — gRPC address of the self-hosted Temporal server
-                          (e.g. temporal-server.stage.internal:7233)
+                          (default: temporal-server.stage.internal:443)
   TEMPORAL_NAMESPACE    — Temporal namespace (default: "default")
   TEMPORAL_TASK_QUEUE   — task queue to poll (e.g. vertex-finetune-stage)
   GCP_PROJECT_ID        — GCP project for Vertex AI / GCS calls
   GCP_REGION            — default region (default: "us-central1")
   LOG_LEVEL             — log level (default: INFO)
 
-No mTLS / API key — the worker reaches the Temporal server over the private
-VPC connector (§12.6 of ARCHITECTURE.md).  Security is at the network layer.
+TLS is enabled without client certificates — Cloud Run terminates TLS at its
+edge (port 443) and the worker reaches the Temporal server over the private
+VPC connector at temporal-server.<env>.internal:443 (§12.6 of ARCHITECTURE.md).
 
 Run via:
   docker run <worker-image> python -m temporal.worker.worker
@@ -25,7 +26,7 @@ import logging
 import os
 import sys
 
-from temporalio.client import Client
+from temporalio.client import Client, TLSConfig
 from temporalio.worker import Worker
 
 # Workflow and activity registrations
@@ -51,7 +52,7 @@ from temporal.workflows.fine_tuning_workflow import (
 # ---------------------------------------------------------------------------
 
 _TEMPORAL_ADDRESS = os.environ.get(
-    "TEMPORAL_ADDRESS", "temporal-server.stage.internal:7233"
+    "TEMPORAL_ADDRESS", "temporal-server.stage.internal:443"
 )
 _TEMPORAL_NAMESPACE = os.environ.get("TEMPORAL_NAMESPACE", "default")
 _TEMPORAL_TASK_QUEUE = os.environ.get(
@@ -87,6 +88,10 @@ async def _run_worker() -> None:
     client = await Client.connect(
         _TEMPORAL_ADDRESS,
         namespace=_TEMPORAL_NAMESPACE,
+        # TLS without client cert — Cloud Run terminates mutual auth at the
+        # network layer; the worker only needs server-side TLS to protect the
+        # gRPC stream over the VPC connector.
+        tls=TLSConfig(),
     )
 
     worker = Worker(
