@@ -94,9 +94,9 @@ def _find_active_job(
         f'display_name="{display_name}" AND '
         f"state=JOB_STATE_QUEUED OR state=JOB_STATE_PENDING OR state=JOB_STATE_RUNNING"
     )
-    jobs = list(
-        aiplatform_client.list_custom_jobs(parent=parent, filter=filter_str)
-    )
+    from google.cloud.aiplatform_v1.types import ListCustomJobsRequest
+    request = ListCustomJobsRequest(parent=parent, filter=filter_str)
+    jobs = list(aiplatform_client.list_custom_jobs(request=request))
     active = [j for j in jobs if j.state.name in _RUNNING_STATES]
     if len(active) == 0:
         return None
@@ -140,6 +140,10 @@ def _submit_job(
         },
     }
 
+    job_labels = {
+        "peft_type": req.peft.type.value,
+        "base_model": req.model.base_model_id.replace("/", "-").lower()[:63],
+    }
     job_spec: dict = {
         "worker_pool_specs": [worker_pool_spec],
         "scheduling": {
@@ -151,21 +155,20 @@ def _submit_job(
             "output_uri_prefix": req.artifacts.checkpoint_uri,
         },
         "enable_web_access": False,
-        "labels": {
-            "peft_type": req.peft.type.value,
-            "base_model": req.model.base_model_id.replace("/", "-").lower()[:63],
-        },
     }
     if tensorboard_resource_name:
         job_spec["tensorboard"] = tensorboard_resource_name
 
+    staging_bucket = "gs://" + req.artifacts.output_uri.split("/")[2]
     custom_job = aiplatform.CustomJob(
         display_name=display_name,
         worker_pool_specs=job_spec["worker_pool_specs"],
         project=project,
         location=location,
+        staging_bucket=staging_bucket,
     )
     custom_job._gca_resource.job_spec.update(job_spec)  # type: ignore[attr-defined]
+    custom_job._gca_resource.labels.update(job_labels)  # type: ignore[attr-defined]
     custom_job.submit()
     return custom_job.resource_name
 
