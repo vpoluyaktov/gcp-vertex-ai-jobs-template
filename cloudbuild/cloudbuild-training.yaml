@@ -9,7 +9,7 @@
 # them per-env; manual `gcloud builds submit` uses these):
 #   _REGION       : Artifact Registry region (us-central1)
 #   _AR_REPO      : Artifact Registry repository (training-images)
-#   _IMAGE_NAME   : image name within the repo (train)
+#   _IMAGE_NAME   : image name within the repo (training)
 #   _ENV          : stage or prod — selects the cloudbuild-<env> SA
 #   _DOCKERFILE   : docker/Dockerfile.training.gpu by default; can be flipped
 #                   to .training for CPU smoke builds
@@ -19,7 +19,7 @@
 substitutions:
   _REGION: us-central1
   _AR_REPO: training-images
-  _IMAGE_NAME: train
+  _IMAGE_NAME: training
   _ENV: stage
   _DOCKERFILE: docker/Dockerfile.training.gpu
   _SBOM_BUCKET: ${PROJECT_ID}-build-artifacts
@@ -41,7 +41,7 @@ steps:
         IMG="${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_IMAGE_NAME}"
         EXTRA_TAG=""
         if [ -n "${_IMAGE_TAG}" ]; then EXTRA_TAG="--tag=$$IMG:${_IMAGE_TAG}"; fi
-        docker build \
+        DOCKER_BUILDKIT=1 docker build \
           --file=${_DOCKERFILE} \
           --tag=$$IMG:${SHORT_SHA} \
           --tag=$$IMG:latest \
