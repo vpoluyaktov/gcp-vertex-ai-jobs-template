@@ -28,20 +28,21 @@ logger = logging.getLogger(__name__)
 _POLL_INTERVAL_SECONDS = 60
 _BUILD_TIMEOUT_SECONDS = 3600  # 1 h
 
-# Artifact Registry path pattern: us-central1-docker.pkg.dev/<project>/<app>/<image>
+# Artifact Registry path: us-central1-docker.pkg.dev/<project>/<repo>/<image>:<tag>
+# Repos are purpose-named: training-images, serving-images (see artifact_registry module).
 _AR_IMAGE_TEMPLATE = (
-    "us-central1-docker.pkg.dev/{project}/{app_name}/{image_name}:{tag}"
+    "us-central1-docker.pkg.dev/{project}/{repo}/{image_name}:{tag}"
 )
 
 
 def _ar_image_uri(
     project: str,
-    app_name: str,
+    repo: str,
     image_name: str,
     tag: str,
 ) -> str:
     return _AR_IMAGE_TEMPLATE.format(
-        project=project, app_name=app_name, image_name=image_name, tag=tag
+        project=project, repo=repo, image_name=image_name, tag=tag
     )
 
 
@@ -50,7 +51,6 @@ def _image_exists(image_uri: str) -> bool:
     try:
         from google.cloud import artifactregistry_v1
 
-        # Quick heuristic: attempt to parse the AR path and call the API.
         # image_uri: us-central1-docker.pkg.dev/project/repo/name:tag
         parts = image_uri.replace("us-central1-docker.pkg.dev/", "").split("/")
         if len(parts) < 3:
@@ -59,12 +59,18 @@ def _image_exists(image_uri: str) -> bool:
         repo = parts[1]
         name_tag = parts[2]
         name, _, tag = name_tag.partition(":")
+        if not tag:
+            tag = "latest"
 
         client = artifactregistry_v1.ArtifactRegistryClient()
-        parent = f"projects/{project}/locations/us-central1/repositories/{repo}/packages/{name}"
-        versions = list(client.list_versions(parent=parent))
-        return any(tag in str(v) for v in versions)
-    except Exception:
+        tag_name = (
+            f"projects/{project}/locations/us-central1"
+            f"/repositories/{repo}/packages/{name}/tags/{tag}"
+        )
+        client.get_tag(name=tag_name)
+        return True
+    except Exception as exc:
+        logger.warning("_image_exists check failed for %s: %s — assuming not found", image_uri, exc)
         return False
 
 
@@ -117,9 +123,8 @@ async def build_training_image(
     Retry policy: BUILD_RETRY (3 attempts).
     heartbeat_timeout: 2 min (set by workflow call-site).
     """
-    app_name = os.environ.get("APP_NAME", "gcp-vertex-ai-jobs-template")
     git_sha = os.environ.get("COMMIT_SHA", "latest")
-    image_uri = _ar_image_uri(project, app_name, "train", git_sha)
+    image_uri = _ar_image_uri(project, "training-images", "training", git_sha)
 
     if _image_exists(image_uri):
         logger.info("Training image '%s' already exists — skipping build.", image_uri)
@@ -177,9 +182,8 @@ async def prepare_serving_artifacts(
     Retry policy: BUILD_RETRY (3 attempts).
     Skip when: artifacts.prepare_serving_image == false (handled in workflow).
     """
-    app_name = os.environ.get("APP_NAME", "gcp-vertex-ai-jobs-template")
     tag = f"v{version_id}"
-    image_uri = _ar_image_uri(project, "serving", "serving", tag)
+    image_uri = _ar_image_uri(project, "serving-images", "serving", tag)
 
     client = cloudbuild.CloudBuildClient()
 
