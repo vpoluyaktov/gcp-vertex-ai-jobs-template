@@ -140,8 +140,8 @@ def _submit_job(
     }
 
     job_labels = {
-        "peft_type": req.peft.type.value,
-        "base_model": req.model.base_model_id.replace("/", "-").lower()[:63],
+        "peft_type": re.sub(r"[^a-z0-9_\-]", "-", req.peft.type.value.lower())[:63],
+        "base_model": re.sub(r"[^a-z0-9_\-]", "-", req.model.base_model_id.lower())[:63],
     }
 
     staging_bucket = "gs://" + req.artifacts.output_uri.split("/")[2]
