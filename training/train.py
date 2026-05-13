@@ -246,7 +246,9 @@ def train(args: argparse.Namespace) -> None:
     # -------------------------------------------------------------------------
     # TensorBoard — Vertex AI auto-uploads logs written under AIP_TENSORBOARD_LOG_DIR
     # -------------------------------------------------------------------------
-    tb_log_dir = os.environ.get("AIP_TENSORBOARD_LOG_DIR", "/tmp/tb_logs")
+    _tb_env = os.environ.get("AIP_TENSORBOARD_LOG_DIR", "/tmp/tb_logs")
+    # AIP_TENSORBOARD_LOG_DIR may be a gs:// URI; pathlib can't mkdir those.
+    tb_log_dir = _tb_env if not _tb_env.startswith("gs://") else "/tmp/tb_logs"
     Path(tb_log_dir).mkdir(parents=True, exist_ok=True)
 
     # -------------------------------------------------------------------------
