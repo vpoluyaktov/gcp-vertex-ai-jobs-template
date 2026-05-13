@@ -75,7 +75,7 @@ def _build_machine_spec(req: FineTuneRequest) -> dict:
 
 
 def _scheduling_strategy(use_spot: bool) -> str:
-    return "SPOT" if use_spot else "STANDARD"
+    return "SPOT" if use_spot else "ON_DEMAND"
 
 
 def _find_active_job(
@@ -90,10 +90,9 @@ def _find_active_job(
     Returns None if no active job is found.
     """
     parent = f"projects/{project}/locations/{location}"
-    filter_str = (
-        f'display_name="{display_name}" AND '
-        f"state=JOB_STATE_QUEUED OR state=JOB_STATE_PENDING OR state=JOB_STATE_RUNNING"
-    )
+    # Filter by display_name only; state is checked in Python below to avoid
+    # Vertex AI filter syntax issues with compound OR expressions.
+    filter_str = f'display_name="{display_name}"'
     from google.cloud.aiplatform_v1.types import ListCustomJobsRequest
     request = ListCustomJobsRequest(parent=parent, filter=filter_str)
     jobs = list(aiplatform_client.list_custom_jobs(request=request))
@@ -144,30 +143,39 @@ def _submit_job(
         "peft_type": req.peft.type.value,
         "base_model": req.model.base_model_id.replace("/", "-").lower()[:63],
     }
-    job_spec: dict = {
-        "worker_pool_specs": [worker_pool_spec],
-        "scheduling": {
-            "strategy": _scheduling_strategy(use_spot),
-            "timeout": "82800s",  # 23 h
-            "restart_job_on_worker_restart": True,
-        },
-        "base_output_directory": {
-            "output_uri_prefix": req.artifacts.checkpoint_uri,
-        },
-        "enable_web_access": False,
-    }
-    if tensorboard_resource_name:
-        job_spec["tensorboard"] = tensorboard_resource_name
 
     staging_bucket = "gs://" + req.artifacts.output_uri.split("/")[2]
     custom_job = aiplatform.CustomJob(
         display_name=display_name,
-        worker_pool_specs=job_spec["worker_pool_specs"],
+        worker_pool_specs=[worker_pool_spec],
         project=project,
         location=location,
         staging_bucket=staging_bucket,
     )
-    custom_job._gca_resource.job_spec.update(job_spec)  # type: ignore[attr-defined]
+
+    # Merge additional CustomJobSpec fields (scheduling, base_output_directory, etc.)
+    # that the CustomJob constructor does not accept.
+    # Use ParseDict+MergeFrom on the raw protobuf _pb to avoid proto-plus
+    # attribute-access restrictions (.update() does not exist on proto.Message).
+    from google.protobuf.json_format import ParseDict as _ParseDict
+
+    extra_spec: dict = {
+        "scheduling": {
+            "strategy": _scheduling_strategy(use_spot),
+            "timeout": "82800s",
+            "restart_job_on_worker_restart": True,
+        },
+        "base_output_directory": {"output_uri_prefix": req.artifacts.checkpoint_uri},
+        "enable_web_access": False,
+    }
+    if tensorboard_resource_name:
+        extra_spec["tensorboard"] = tensorboard_resource_name
+
+    spec_pb = custom_job._gca_resource._pb.job_spec  # type: ignore[attr-defined]
+    update_pb = type(spec_pb)()
+    _ParseDict(extra_spec, update_pb, ignore_unknown_fields=True)
+    spec_pb.MergeFrom(update_pb)
+
     custom_job._gca_resource.labels.update(job_labels)  # type: ignore[attr-defined]
     custom_job.submit()
     return custom_job.resource_name
