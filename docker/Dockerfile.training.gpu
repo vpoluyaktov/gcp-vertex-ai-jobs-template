@@ -68,6 +68,11 @@ ENV MAX_JOBS=4 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# flash-attn setup.py imports torch to detect CUDA version; install torch
+# (CUDA build) first so the import succeeds on the CPU Cloud Build runner.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install torch>=2.4.0 --index-url https://download.pytorch.org/whl/cu124
+
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip wheel --wheel-dir=/wheels \
         --no-deps \
